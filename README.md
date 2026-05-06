@@ -16,7 +16,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 
 ### 指定端口
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -port 12345
+bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -port 20086
 ```
 
 ### 指定 Reality 伪装域名
@@ -26,7 +26,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 
 ### 自动安装并同时指定端口和伪装域名
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install -port 12345 -reality-domain example.com
+bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install -port 20086 -reality-domain example.com
 ```
 
 ## 说明
