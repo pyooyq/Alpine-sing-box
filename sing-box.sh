@@ -784,7 +784,6 @@ run_install_flow() {
 
     sleep 5
     get_info
-    add_nginx_conf
     create_shortcut
 }
 
