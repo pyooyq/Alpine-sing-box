@@ -249,7 +249,7 @@ install_singbox() {
     [ ! -d "${work_dir}" ] && mkdir -p "${work_dir}" && chmod 777 "${work_dir}"
     # latest_version=$(curl -s "https://api.github.com/repos/SagerNet/sing-box/releases" | jq -r '[.[] | select(.prerelease==false)][0].tag_name | sub("^v"; "")')
     # curl -sLo "${work_dir}/${server_name}.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${ARCH}.tar.gz"
-    # curl -sLo "${work_dir}/qrencode" "https://github.com/eooce/test/releases/download/${ARCH}/qrencode-linux-${ARCH}"
+    # curl -sLo "${work_dir}/qrencode" "https://example.invalid/qrencode-linux-${ARCH}"
     curl -sLo "${work_dir}/qrencode" "https://$ARCH.ssss.nyc.mn/qrencode"
     curl -sLo "${work_dir}/sing-box" "https://$ARCH.ssss.nyc.mn/sb"
     curl -sLo "${work_dir}/argo" "https://$ARCH.ssss.nyc.mn/bot"
@@ -524,13 +524,13 @@ EOF
 
 }
 
-# 生成节点和订阅链接
-get_info() {  
+# 生成节点信息
+get_info() {
   yellow "\nip检测中,请稍等...\n"
   server_ip=$(get_realip)
   clear
   isp=$(curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://api.ip.sb/geoip" | tr -d '\n' | awk -F\" '{c="";i="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="isp")i=$(x+2)};if(c&&i)print c"-"i}' | sed 's/ /_/g' || curl -sm 3 -H "User-Agent: Mozilla/5.0" "https://ipapi.co/json" | tr -d '\n' | awk -F\" '{c="";o="";for(x=1;x<=NF;x++){if($x=="country_code")c=$(x+2);if($x=="org")o=$(x+2)};if(c&&o)print c"-"o}' | sed 's/ /_/g' || echo "$hostname")
-  
+
   if [ -f "${work_dir}/argo.log" ]; then
       for i in {1..5}; do
           purple "第 $i 次尝试获取ArgoDoamin中..."
@@ -559,127 +559,7 @@ tuic://${uuid}:${password}@${server_ip}:${tuic_port}?sni=www.bing.com&congestion
 EOF
 echo ""
 while IFS= read -r line; do echo -e "${purple}$line"; done < ${work_dir}/url.txt
-base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-chmod 644 ${work_dir}/sub.txt
 yellow "\n温馨提醒：需打开V2rayN或其他软件里的 "跳过证书验证"，或将节点的Insecure或TLS里设置为"true"\n"
-green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接：http://${server_ip}:${nginx_port}/${password}\n"
-$work_dir/qrencode "http://${server_ip}:${nginx_port}/${password}"
-yellow "\n=========================================================================================="
-green "\n\nClash,Mihomo系列订阅链接：https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}\n"
-$work_dir/qrencode "https://sublink.eooce.com/clash?config=http://${server_ip}:${nginx_port}/${password}"
-yellow "\n=========================================================================================="
-green "\n\nSing-box订阅链接：https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}\n"
-$work_dir/qrencode "https://sublink.eooce.com/singbox?config=http://${server_ip}:${nginx_port}/${password}"
-yellow "\n=========================================================================================="
-green "\n\nSurge订阅链接：https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}\n"
-$work_dir/qrencode "https://sublink.eooce.com/surge?config=http://${server_ip}:${nginx_port}/${password}"
-yellow "\n==========================================================================================\n"
-}
-
-# nginx订阅配置
-add_nginx_conf() {
-    if ! command_exists nginx; then
-        red "nginx未安装,无法配置订阅服务"
-        return 1
-    else
-        manage_service "nginx" "stop" > /dev/null 2>&1
-        pkill nginx  > /dev/null 2>&1
-    fi
-
-    mkdir -p /etc/nginx/conf.d
-
-    [[ -f "/etc/nginx/conf.d/sing-box.conf" ]] && cp /etc/nginx/conf.d/sing-box.conf /etc/nginx/conf.d/sing-box.conf.bak.sb
-
-    cat > /etc/nginx/conf.d/sing-box.conf << EOF
-# sing-box 订阅配置
-server {
-    listen $nginx_port;
-    listen [::]:$nginx_port;
-    server_name _;
-
-    # 安全设置
-    add_header X-Frame-Options DENY;
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-
-    location = /$password {
-        alias /etc/sing-box/sub.txt;
-        default_type 'text/plain; charset=utf-8';
-        add_header Cache-Control "no-cache, no-store, must-revalidate";
-        add_header Pragma "no-cache";
-        add_header Expires "0";
-    }
-
-    location / {
-        return 404;
-    }
-
-    # 禁止访问隐藏文件
-    location ~ /\. {
-        deny all;
-        access_log off;
-        log_not_found off;
-    }
-}
-EOF
-
-    # 检查主配置文件是否存在
-    if [ -f "/etc/nginx/nginx.conf" ]; then
-        cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.bak.sb > /dev/null 2>&1
-        sed -i -e '15{/include \/etc\/nginx\/modules\/\*\.conf/d;}' -e '18{/include \/etc\/nginx\/conf\.d\/\*\.conf/d;}' /etc/nginx/nginx.conf > /dev/null 2>&1
-        # 检查是否已包含配置目录
-        if ! grep -q "include.*conf.d" /etc/nginx/nginx.conf; then
-            http_end_line=$(grep -n "^}" /etc/nginx/nginx.conf | tail -1 | cut -d: -f1)
-            if [ -n "$http_end_line" ]; then
-                sed -i "${http_end_line}i \    include /etc/nginx/conf.d/*.conf;" /etc/nginx/nginx.conf > /dev/null 2>&1
-            fi
-        fi
-    else 
-        cat > /etc/nginx/nginx.conf << EOF
-user nginx;
-worker_processes auto;
-error_log /var/log/nginx/error.log;
-pid /run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    include       /etc/nginx/mime.types;
-    default_type  application/octet-stream;
-    
-    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
-                      '$status $body_bytes_sent "$http_referer" '
-                      '"$http_user_agent" "$http_x_forwarded_for"';
-    
-    access_log  /var/log/nginx/access.log  main;
-    sendfile        on;
-    keepalive_timeout  65;
-    
-    include /etc/nginx/conf.d/*.conf;
-}
-EOF
-    fi
-
-    # 检查nginx配置语法
-    if nginx -t > /dev/null 2>&1; then
-    
-        if nginx -s reload > /dev/null 2>&1; then
-            green "nginx订阅配置已加载"
-        else
-            start_nginx  > /dev/null 2>&1
-        fi
-    else
-        yellow "nginx配置失败,订阅不可应,但不影响节点使用, issues反馈: https://github.com/eooce/Sing-box/issues"
-        restart_nginx  > /dev/null 2>&1
-        if [ $? -eq 0 ]; then
-            green "nginx订阅配置已生效"
-        else
-            [[ -f "/etc/nginx/nginx.conf.bak.sb" ]] && cp "/etc/nginx/nginx.conf.bak.sb" /etc/nginx/nginx.conf > /dev/null 2>&1
-            restart_nginx  > /dev/null 2>&1
-        fi
-    fi
 }
 
 # 通用服务管理函数
@@ -969,9 +849,8 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/tcp > /dev/null 2>&1
                     sed -i 's/\(vless:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 /etc/sing-box/url.txt > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-                    green "\nvless-reality端口已修改成：${purple}$new_port${re} ${green}请更新订阅或手动更改vless-reality端口${re}\n"
+                    green "\nvless-reality端口已修改成：${purple}$new_port${re} ${green}请手动更改vless-reality端口${re}\n"
                     ;;
                 2)
                     reading "\n请输入hysteria2端口 (回车跳过将使用随机端口): " new_port
@@ -980,9 +859,8 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(hysteria2:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-                    green "\nhysteria2端口已修改为：${purple}${new_port}${re} ${green}请更新订阅或手动更改hysteria2端口${re}\n"
+                    green "\nhysteria2端口已修改为：${purple}${new_port}${re} ${green}请手动更改hysteria2端口${re}\n"
                     ;;
                 3)
                     reading "\n请输入tuic端口 (回车跳过将使用随机端口): " new_port
@@ -991,9 +869,8 @@ change_config() {
                     restart_singbox
                     allow_port $new_port/udp > /dev/null 2>&1
                     sed -i 's/\(tuic:\/\/[^@]*@[^:]*:\)[0-9]\{1,\}/\1'"$new_port"'/' $client_dir
-                    base64 -w0 $client_dir > /etc/sing-box/sub.txt
                     while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-                    green "\ntuic端口已修改为：${purple}${new_port}${re} ${green}请更新订阅或手动更改tuic端口${re}\n"
+                    green "\ntuic端口已修改为：${purple}${new_port}${re} ${green}请手动更改tuic端口${re}\n"
                     ;;
                 4)  
                     reading "\n请输入vmess-argo端口 (回车跳过将使用随机端口): " new_port
@@ -1048,9 +925,8 @@ change_config() {
             VMESS="{ \"v\": \"2\", \"ps\": \"${isp}\", \"add\": \"www.visa.com.tw\", \"port\": \"443\", \"id\": \"${new_uuid}\", \"aid\": \"0\", \"scy\": \"none\", \"net\": \"ws\", \"type\": \"none\", \"host\": \"${argodomain}\", \"path\": \"/vmess-argo?ed=2560\", \"tls\": \"tls\", \"sni\": \"${argodomain}\", \"alpn\": \"\", \"fp\": \"\", \"allowlnsecure\": \"flase\"}"
             encoded_vmess=$(echo "$VMESS" | base64 -w0)
             sed -i -E '/vmess:\/\//{s@vmess://.*@vmess://'"$encoded_vmess"'@}' $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nUUID已修改为：${purple}${new_uuid}${re} ${green}请更新订阅或手动更改所有节点的UUID${re}\n"
+            green "\nUUID已修改为：${purple}${new_uuid}${re} ${green}请手动更改所有节点的UUID${re}\n"
             ;;
         3)  
             clear
@@ -1077,10 +953,9 @@ change_config() {
                 ' "$config_dir" > "$config_file.tmp" && mv "$config_file.tmp" "$config_dir"
                 restart_singbox
                 sed -i "s/\(vless:\/\/[^\?]*\?\([^\&]*\&\)*sni=\)[^&]*/\1$new_sni/" $client_dir
-                base64 -w0 $client_dir > /etc/sing-box/sub.txt
                 while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
                 echo ""
-                green "\nReality sni已修改为：${purple}${new_sni}${re} ${green}请更新订阅或手动更改reality节点的sni域名${re}\n"
+                green "\nReality sni已修改为：${purple}${new_sni}${re} ${green}请手动更改reality节点的sni域名${re}\n"
             ;; 
         4)  
             purple "端口跳跃需确保跳跃区间的端口没有被占用，nat鸡请注意可用端口范围，否则可能造成节点不通\n"
@@ -1130,9 +1005,8 @@ EOF
             isp=$(curl -s --max-time 2 https://speed.cloudflare.com/meta | awk -F\" '{print $26"-"$18}' | sed -e 's/ /_/g' || echo "vps")
             sed -i.bak "/hysteria2:/d" $client_dir
             sed -i "${line_number}i hysteria2://$uuid@$ip:$listen_port?peer=www.bing.com&insecure=1&alpn=h3&obfs=none&mport=$listen_port,$min_port-$max_port#$isp" $client_dir
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
             while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
-            green "\nhysteria2端口跳跃已开启,跳跃端口为：${purple}$min_port-$max_port${re} ${green}请更新订阅或手动复制以上hysteria2节点${re}\n"
+            green "\nhysteria2端口跳跃已开启,跳跃端口为：${purple}$min_port-$max_port${re} ${green}请手动复制以上hysteria2节点${re}\n"
             ;;
         5)  
             iptables -t nat -F PREROUTING  > /dev/null 2>&1
@@ -1147,8 +1021,7 @@ EOF
             else
                 manage_packages uninstall iptables ip6tables iptables-persistent iptables-service > /dev/null 2>&1
             fi
-            sed -i '/hysteria2/s/&mport=[^#&]*//g' /etc/sing-box/url.txt
-            base64 -w0 $client_dir > /etc/sing-box/sub.txt
+            while IFS= read -r line; do yellow "$line"; done < ${work_dir}/url.txt
             green "\n端口跳跃已删除\n"
             ;;
         6)  change_cfip ;;
@@ -1157,108 +1030,72 @@ EOF
     esac
 }
 
-disable_open_sub() {
-    local singbox_status=$(check_singbox 2>/dev/null)
-    local singbox_installed=$?
-    
-    if [ $singbox_installed -eq 2 ]; then
-        yellow "sing-box 尚未安装！"
-        sleep 1
-        menu
-        return
-    fi
-    
+change_cfip() {
     clear
-    echo ""
-    green "=== 管理节点订阅 ===\n"
-    skyblue "------------"
-    green "1. 关闭节点订阅"
-    skyblue "------------"
-    green "2. 开启节点订阅"
-    skyblue "------------"
-    green "3. 更换订阅端口"
-    skyblue "------------"
-    purple "0. 返回主菜单"
-    skyblue "------------"
-    reading "请输入选择: " choice
-    case "${choice}" in
-        1)
-            if command -v nginx &>/dev/null; then
-                if command_exists rc-service 2>/dev/null; then
-                    rc-service nginx status | grep -q "started" && rc-service nginx stop || red "nginx not running"
-                else 
-                    [ "$(systemctl is-active nginx)" = "active" ] && systemctl stop nginx || red "ngixn not running"
-                fi
-            else
-                yellow "Nginx is not installed"
-            fi
+    yellow "修改vmess-argo优选域名\n"
+    green "1: cf.090227.xyz  2: cf.877774.xyz  3: cf.877771.xyz  4: cdns.doon.eu.org  5: cf.zhetengsha.eu.org  6: time.is\n"
+    reading "请输入你的优选域名或优选IP\n(请输入1至6选项,可输入域名:端口 或 IP:端口,直接回车默认使用1): " cfip_input
 
-            green "\n已关闭节点订阅\n"     
-            ;; 
-        2)
-            green "\n已开启节点订阅\n"
-            server_ip=$(get_realip)
-            password=$(tr -dc A-Za-z < /dev/urandom | head -c 32) 
-            sed -i "s|\(location = /\)[^ ]*|\1$password|" /etc/nginx/conf.d/sing-box.conf
-	    sub_port=$(port=$(grep -E 'listen [0-9]+;' "/etc/nginx/conf.d/sing-box.conf" | awk '{print $2}' | sed 's/;//'); if [ "$port" -eq 80 ]; then echo ""; else echo "$port"; fi)
-            start_nginx
-            (port=$(grep -E 'listen [0-9]+;' "/etc/nginx/conf.d/sing-box.conf" | awk '{print $2}' | sed 's/;//'); if [ "$port" -eq 80 ]; then echo ""; else green "订阅端口：$port"; fi); link=$(if [ -z "$sub_port" ]; then echo "http://$server_ip/$password"; else echo "http://$server_ip:$sub_port/$password"; fi); green "\n新的节点订阅链接：$link\n"
-            ;; 
-
-        3)
-            reading "请输入新的订阅端口(1-65535):" sub_port
-            [ -z "$sub_port" ] && sub_port=$(shuf -i 2000-65000 -n 1)
-            
-            # 检查端口是否被占用
-            until [[ -z $(lsof -iTCP:"$sub_port" -sTCP:LISTEN -t) ]]; do
-                if [[ -n $(lsof -iTCP:"$sub_port" -sTCP:LISTEN -t) ]]; then
-                    echo -e "${red}端口 $sub_port 已经被其他程序占用，请更换端口重试${re}"
-                    reading "请输入新的订阅端口(1-65535):" sub_port
-                    [[ -z $sub_port ]] && sub_port=$(shuf -i 2000-65000 -n 1)
-                fi
-            done
-
-            # 备份当前配置
-            if [ -f "/etc/nginx/conf.d/sing-box.conf" ]; then
-                cp "/etc/nginx/conf.d/sing-box.conf" "/etc/nginx/conf.d/sing-box.conf.bak.$(date +%Y%m%d)"
-            fi
-            
-            # 更新端口配置
-            sed -i 's/listen [0-9]\+;/listen '$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            sed -i 's/listen \[::\]:[0-9]\+;/listen [::]:'$sub_port';/g' "/etc/nginx/conf.d/sing-box.conf"
-            path=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-            server_ip=$(get_realip)
-            
-            # 放行新端口
-            allow_port $sub_port/tcp > /dev/null 2>&1
-            
-            # 测试nginx配置
-            if nginx -t > /dev/null 2>&1; then
-                # 尝试重新加载配置
-                if nginx -s reload > /dev/null 2>&1; then
-                    green "nginx配置已重新加载，端口更换成功"
+    if [ -z "$cfip_input" ]; then
+        cfip="cf.090227.xyz"
+        cfport="443"
+    else
+        case "$cfip_input" in
+            "1")
+                cfip="cf.090227.xyz"
+                cfport="443"
+                ;;
+            "2")
+                cfip="cf.877774.xyz"
+                cfport="443"
+                ;;
+            "3")
+                cfip="cf.877771.xyz"
+                cfport="443"
+                ;;
+            "4")
+                cfip="cdns.doon.eu.org"
+                cfport="443"
+                ;;
+            "5")
+                cfip="cf.zhetengsha.eu.org"
+                cfport="443"
+                ;;
+            "6")
+                cfip="time.is"
+                cfport="443"
+                ;;
+            *)
+                if [[ "$cfip_input" =~ : ]]; then
+                    cfip=$(echo "$cfip_input" | cut -d':' -f1)
+                    cfport=$(echo "$cfip_input" | cut -d':' -f2)
                 else
-                    yellow "配置重新加载失败，尝试重启nginx服务..."
-                    restart_nginx
+                    cfip="$cfip_input"
+                    cfport="443"
                 fi
-                green "\n订阅端口更换成功\n"
-                green "新的订阅链接为：http://$server_ip:$sub_port/$path\n"
-            else
-                red "nginx配置测试失败，正在恢复原有配置..."
-                if [ -f "/etc/nginx/conf.d/sing-box.conf.bak."* ]; then
-                    latest_backup=$(ls -t /etc/nginx/conf.d/sing-box.conf.bak.* | head -1)
-                    cp "$latest_backup" "/etc/nginx/conf.d/sing-box.conf"
-                    yellow "已恢复原有nginx配置"
-                fi
-                return 1
-            fi
-            ;; 
-        0)  menu ;; 
-        *)  red "无效的选项！" ;;
-    esac
+                ;;
+        esac
+    fi
+
+content=$(cat "$client_dir")
+vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
+encoded_part="${vmess_url#vmess://}"
+decoded_json=$(echo "$encoded_part" | base64 --decode 2>/dev/null)
+updated_json=$(echo "$decoded_json" | jq --arg cfip "$cfip" --argjson cfport "$cfport" \
+    '.add = $cfip | .port = $cfport')
+new_encoded_part=$(echo "$updated_json" | base64 -w0)
+new_vmess_url="vmess://$new_encoded_part"
+new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
+echo "$new_content" > "$client_dir"
+green "\nvmess节点优选域名已更新为：${purple}${cfip}:${cfport},${green}请手动复制以下vmess-argo节点${re}\n"
+purple "$new_vmess_url\n"
 }
 
-# singbox 管理
+# 查看节点信息
+check_nodes() {
+    while IFS= read -r line; do purple "${purple}$line"; done < ${work_dir}/url.txt
+}
+
 manage_singbox() {
     # 检查sing-box状态
     local singbox_status=$(check_singbox 2>/dev/null)
@@ -1323,7 +1160,7 @@ manage_argo() {
          ;; 
         4)
             clear
-            yellow "\n固定隧道可为json或token，固定隧道端口为8001，自行在cf后台设置\n\njson在f佬维护的站点里获取，获取地址：${purple}https://fscarmen.cloudflare.now.cc${re}\n"
+            yellow "\n固定隧道可为json或token，固定隧道端口为8001，自行在cf后台设置\n"
             reading "\n请输入你的argo域名: " argo_domain
             ArgoDomain=$argo_domain
             reading "\n请输入你的argo密钥(token或json): " argo_auth
@@ -1424,98 +1261,6 @@ green "ArgoDomain：${purple}$get_argodomain${re}\n"
 ArgoDomain=$get_argodomain
 }
 
-# 更新Argo域名到订阅
-change_argo_domain() {
-content=$(cat "$client_dir")
-vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-vmess_prefix="vmess://"
-encoded_vmess="${vmess_url#"$vmess_prefix"}"
-decoded_vmess=$(echo "$encoded_vmess" | base64 --decode)
-updated_vmess=$(echo "$decoded_vmess" | jq --arg new_domain "$ArgoDomain" '.host = $new_domain | .sni = $new_domain')
-encoded_updated_vmess=$(echo "$updated_vmess" | base64 | tr -d '\n')
-new_vmess_url="${vmess_prefix}${encoded_updated_vmess}"
-new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-echo "$new_content" > "$client_dir"
-base64 -w0 ${work_dir}/url.txt > ${work_dir}/sub.txt
-green "vmess节点已更新,更新订阅或手动复制以下vmess-argo节点\n"
-purple "$new_vmess_url\n" 
-}
-
-# 查看节点信息和订阅链接
-check_nodes() {
-    while IFS= read -r line; do purple "${purple}$line"; done < ${work_dir}/url.txt
-    server_ip=$(get_realip)
-    lujing=$(sed -n 's|.*location = /\([^ ]*\).*|\1|p' "/etc/nginx/conf.d/sing-box.conf")
-    sub_port=$(sed -n 's/^\s*listen \([0-9]\+\);/\1/p' "/etc/nginx/conf.d/sing-box.conf")
-    base64_url="http://${server_ip}:${sub_port}/${lujing}"
-    green "\n\nSurge订阅链接: ${purple}https://sublink.eooce.com/surge?config=${base64_url}${re}\n"
-    green "sing-box订阅链接: ${purple}https://sublink.eooce.com/singbox?config=${base64_url}${purple}\n"
-    green "Mihomo/Clash系列订阅链接: ${purple}https://sublink.eooce.com/clash?config=${base64_url}${re}\n"
-    green "V2rayN,Shadowrocket,Nekobox,Loon,Karing,Sterisand订阅链接: ${purple}${base64_url}${re}\n"
-}
-
-change_cfip() {
-    clear
-    yellow "修改vmess-argo优选域名\n"
-    green "1: cf.090227.xyz  2: cf.877774.xyz  3: cf.877771.xyz  4: cdns.doon.eu.org  5: cf.zhetengsha.eu.org  6: time.is\n"
-    reading "请输入你的优选域名或优选IP\n(请输入1至6选项,可输入域名:端口 或 IP:端口,直接回车默认使用1): " cfip_input
-
-    if [ -z "$cfip_input" ]; then
-        cfip="cf.090227.xyz"
-        cfport="443"
-    else
-        case "$cfip_input" in
-            "1")
-                cfip="cf.090227.xyz"
-                cfport="443"
-                ;;
-            "2")
-                cfip="cf.877774.xyz"
-                cfport="443"
-                ;;
-            "3")
-                cfip="cf.877771.xyz"
-                cfport="443"
-                ;;
-            "4")
-                cfip="cdns.doon.eu.org"
-                cfport="443"
-                ;;
-            "5")
-                cfip="cf.zhetengsha.eu.org"
-                cfport="443"
-                ;;
-            "6")
-                cfip="time.is"
-                cfport="443"
-                ;;
-            *)
-                if [[ "$cfip_input" =~ : ]]; then
-                    cfip=$(echo "$cfip_input" | cut -d':' -f1)
-                    cfport=$(echo "$cfip_input" | cut -d':' -f2)
-                else
-                    cfip="$cfip_input"
-                    cfport="443"
-                fi
-                ;;
-        esac
-    fi
-
-content=$(cat "$client_dir")
-vmess_url=$(grep -o 'vmess://[^ ]*' "$client_dir")
-encoded_part="${vmess_url#vmess://}"
-decoded_json=$(echo "$encoded_part" | base64 --decode 2>/dev/null)
-updated_json=$(echo "$decoded_json" | jq --arg cfip "$cfip" --argjson cfport "$cfport" \
-    '.add = $cfip | .port = $cfport')
-new_encoded_part=$(echo "$updated_json" | base64 -w0)
-new_vmess_url="vmess://$new_encoded_part"
-new_content=$(echo "$content" | sed "s|$vmess_url|$new_vmess_url|")
-echo "$new_content" > "$client_dir"
-base64 -w0 "${work_dir}/url.txt" > "${work_dir}/sub.txt"
-green "\nvmess节点优选域名已更新为：${purple}${cfip}:${cfport},${green}更新订阅或手动复制以下vmess-argo节点${re}\n"
-purple "$new_vmess_url\n"
-}
-
 # 主菜单
 menu() {
    singbox_status=$(check_singbox 2>/dev/null)
@@ -1524,10 +1269,7 @@ menu() {
 
    clear
    echo ""
-   green "Telegram群组: ${purple}https://t.me/eooceu${re}"
-   green "YouTube频道: ${purple}https://youtube.com/@eooce${re}"
-   green "Github地址: ${purple}https://github.com/eooce/sing-box${re}\n"
-   purple "=== 老王sing-box四合一安装脚本 ===\n"
+   purple "=== sing-box 四合一安装脚本 ===\n"
    purple "---Argo 状态: ${argo_status}"
    purple "--Nginx 状态: ${nginx_status}"
    purple "singbox 状态: ${singbox_status}\n"
@@ -1539,13 +1281,10 @@ menu() {
    echo  "==============="
    green  "5. 查看节点信息"
    green  "6. 修改节点配置"
-   green  "7. 管理节点订阅"
-   echo  "==============="
-   purple "8. ssh综合工具箱"
    echo  "==============="
    red "0. 退出脚本"
    echo "==========="
-   reading "请输入选择(0-9): " choice
+   reading "请输入选择(0-6): " choice
    echo ""
 }
 
@@ -1567,13 +1306,8 @@ while true; do
         4) manage_argo ;;
         5) check_nodes ;;
         6) change_config ;;
-        7) disable_open_sub ;;
-        8)
-           clear
-           bash <(curl -Ls ssh_tool.eooce.com)
-           ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 8" ;;
+        *) red "无效的选项，请输入 0 到 6" ;;
    esac
    read -n 1 -s -r -p $'\033[1;91m按任意键返回...\033[0m'
 done
