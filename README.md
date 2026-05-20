@@ -1,6 +1,16 @@
 # Alpine-sing-box
 
-这是一个 **AI 改写版** 的 `sing-box` 远程拉取执行脚本。
+这是一个精简版 `sing-box` Reality-only 安装/管理脚本，只配置 VLESS Reality 入站。
+
+## 功能
+
+- 仅安装和运行 `sing-box`
+- 仅生成 VLESS Reality 配置
+- 支持自定义 Reality 端口和伪装域名/SNI
+- 不安装 nginx
+- 不配置 Argo/Cloudflare Tunnel
+- 不生成订阅文件
+- 安装后保留 `sb` 快捷命令打开管理菜单
 
 ## 免责声明
 
@@ -12,32 +22,47 @@
 ## 远程拉取执行
 
 ### 交互模式
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh)
 ```
 
 ### 自动安装
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install
 ```
 
-### 指定端口
+### 自动安装并指定端口
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -port 20086
+bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install -port 20086
 ```
 
-### 指定 Reality 伪装域名
+### 自动安装并指定 Reality 伪装域名
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -reality-domain example.com
+bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install -reality-domain example.com
 ```
 
 ### 自动安装并同时指定端口和伪装域名
+
 ```bash
 bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) -install -port 20086 -reality-domain example.com
 ```
 
+## 管理
+
+安装完成后可执行：
+
+```bash
+sb
+```
+
+菜单支持查看 Reality 参数、修改端口、修改伪装域名、启动/停止/重启 sing-box、卸载。
+
 ## 说明
 
 - 建议在 `root` 环境下执行
-- 脚本主要面向 Alpine 系统
+- 脚本主要面向 Alpine/OpenRC，也兼容常见 systemd 发行版
 - 如不传参数，默认进入交互菜单
