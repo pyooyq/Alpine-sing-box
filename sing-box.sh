@@ -520,16 +520,10 @@ show_singbox_logs() {
 create_shortcut() {
     mkdir -p "$work_dir"
 
-    if [ -r "$0" ]; then
-        cp "$0" "$installed_script" 2>/dev/null || true
-    fi
-
-    if [ ! -s "$installed_script" ]; then
-        cat > "$installed_script" << 'EOF'
+    cat > "$installed_script" << 'EOF'
 #!/usr/bin/env bash
-bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) "$@"
+exec bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) "$@"
 EOF
-    fi
 
     chmod +x "$installed_script"
     cat > /usr/bin/sb << EOF
