@@ -5,7 +5,7 @@
 ## 功能
 
 - 优先复用本机已安装且可执行的 `sing-box`
-- 本机没有可用 `sing-box` 时再尝试安装或下载
+- 本机没有可用 `sing-box` 时先尝试 Alpine 包安装，再补兼容库并下载上游二进制
 - 仅生成 VLESS Reality 配置
 - 支持自定义 Reality 端口和伪装域名/SNI
 - 不安装 nginx
@@ -60,7 +60,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持查看 Reality 参数、修改端口、修改伪装域名、启动/停止/重启 sing-box、卸载。
+菜单支持查看 Reality 参数、修改端口、修改伪装域名、启动/停止/重启 sing-box、查看日志、卸载。
 
 ## 说明
 

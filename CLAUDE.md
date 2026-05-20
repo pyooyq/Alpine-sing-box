@@ -60,7 +60,7 @@ The install flow is:
 
 1. `run_install_flow` checks whether Reality state and the sing-box binary already exist.
 2. `ensure_dependencies` installs minimal dependencies using the detected package manager.
-3. `install_singbox_binary` first reuses a local working sing-box binary, then tries Alpine `apk add sing-box`, then downloads the latest upstream release.
+3. `install_singbox_binary` first reuses a local working sing-box binary, then tries Alpine `apk add sing-box`/`sing-box-openrc`, then installs Alpine compatibility libraries and downloads the latest upstream release.
 4. Downloaded or copied sing-box binaries must pass `sing-box version` before Reality parameters are generated.
 5. `generate_reality_values` creates UUID, Reality keypair, and short ID.
 6. `write_config` writes `/etc/sing-box/config.json` with a single VLESS Reality inbound and direct outbound.
@@ -71,7 +71,7 @@ The install flow is:
 
 Configuration mutation is handled by `change_port` and `change_reality_domain`, which update `reality.env`, rewrite `config.json`, restart sing-box, and print the updated Reality parameters. Keep `PORT`, `REALITY_DOMAIN`, `UUID`, `PRIVATE_KEY`, `PUBLIC_KEY`, and `SHORT_ID` in sync between state and generated config.
 
-Service management should remain limited to sing-box. If service behavior changes, update both the systemd and OpenRC branches.
+Service management should remain limited to sing-box. If service behavior changes, update both the systemd and OpenRC branches. The menu includes `show_singbox_logs`, which first tails `/etc/sing-box/sing-box.log`, then falls back to `journalctl -u sing-box` on systemd or `/var/log/messages`/`/var/log/syslog` on OpenRC.
 
 ## Important implementation details
 

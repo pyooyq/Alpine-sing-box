@@ -164,6 +164,13 @@ ensure_dependencies() {
     command_exists update-ca-certificates && update-ca-certificates >/dev/null 2>&1 || true
 }
 
+ensure_alpine_compat() {
+    command_exists apk || return 0
+
+    yellow "检测到 Alpine，安装 glibc 兼容库以支持上游 sing-box 二进制..."
+    apk add --no-cache gcompat libc6-compat libstdc++ >/dev/null 2>&1 || yellow "兼容库安装失败，将继续尝试。"
+}
+
 is_working_singbox() {
     [ -x "$1" ] && "$1" version >/dev/null 2>&1
 }
@@ -192,7 +199,7 @@ install_singbox_from_package() {
     command_exists apk || return 1
 
     yellow "未发现可用的本机 sing-box，尝试通过 apk 安装 sing-box..."
-    apk add --no-cache sing-box >/dev/null 2>&1 || return 1
+    apk add --no-cache sing-box || apk add --no-cache sing-box-openrc || return 1
     use_existing_singbox
 }
 
@@ -213,6 +220,8 @@ install_singbox_binary() {
 
     use_existing_singbox && return 0
     install_singbox_from_package && return 0
+
+    ensure_alpine_compat
 
     arch=$(detect_arch)
     mkdir -p "$work_dir"
@@ -245,8 +254,12 @@ install_singbox_binary() {
     rm -rf "$tmp_dir" "$archive"
 
     if ! is_working_singbox "${work_dir}/${server_name}"; then
-        red "下载的 sing-box 无法在当前系统执行，请先用系统包管理器安装 sing-box 后重试。"
-        red "Alpine 可尝试执行: apk add --no-cache sing-box"
+        ensure_alpine_compat
+    fi
+
+    if ! is_working_singbox "${work_dir}/${server_name}"; then
+        red "下载的 sing-box 无法在当前系统执行。"
+        red "请先用系统包管理器安装 sing-box 后重试；Alpine 可尝试执行: apk add --no-cache sing-box sing-box-openrc gcompat libc6-compat"
         exit 1
     fi
 }
@@ -471,6 +484,39 @@ show_reality_info() {
     purple "$link\n"
 }
 
+show_singbox_logs() {
+    local log_file="${work_dir}/sing-box.log"
+
+    clear
+    green "=== sing-box 日志 ===\n"
+
+    if [ -s "$log_file" ]; then
+        yellow "最近 200 行文件日志: $log_file\n"
+        tail -n 200 "$log_file"
+        return 0
+    fi
+
+    if command_exists journalctl && command_exists systemctl && [ -f /etc/systemd/system/sing-box.service ]; then
+        yellow "未找到文件日志，显示最近 200 行 systemd journal 日志。\n"
+        journalctl -u sing-box -n 200 --no-pager
+        return 0
+    fi
+
+    if command_exists rc-service && [ -f /etc/init.d/sing-box ]; then
+        yellow "未找到文件日志。OpenRC 可尝试查看系统日志中的 sing-box 记录。"
+        if [ -f /var/log/messages ]; then
+            tail -n 200 /var/log/messages | grep -i 'sing-box' || true
+        elif [ -f /var/log/syslog ]; then
+            tail -n 200 /var/log/syslog | grep -i 'sing-box' || true
+        else
+            yellow "未发现 /var/log/messages 或 /var/log/syslog。"
+        fi
+        return 0
+    fi
+
+    yellow "暂无日志。请先安装并启动 sing-box。"
+}
+
 create_shortcut() {
     mkdir -p "$work_dir"
 
@@ -560,6 +606,7 @@ manage_singbox() {
     green "1. 启动 sing-box"
     green "2. 停止 sing-box"
     green "3. 重启 sing-box"
+    green "4. 查看 sing-box 日志"
     purple "0. 返回主菜单"
     reading "请输入选择: " choice
 
@@ -567,6 +614,7 @@ manage_singbox() {
         1) start_singbox ;;
         2) stop_singbox ;;
         3) restart_singbox ;;
+        4) show_singbox_logs ;;
         0) return ;;
         *) red "无效的选项" ;;
     esac
@@ -611,9 +659,10 @@ menu() {
     green "3. 修改 Reality 端口"
     green "4. 修改 Reality 伪装域名"
     green "5. sing-box 服务管理"
-    red "6. 卸载 sing-box"
+    green "6. 查看 sing-box 日志"
+    red "7. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-6): " choice
+    reading "请输入选择(0-7): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -631,9 +680,10 @@ while true; do
         3) change_port ;;
         4) change_reality_domain ;;
         5) manage_singbox ;;
-        6) uninstall_singbox ;;
+        6) show_singbox_logs ;;
+        7) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 6" ;;
+        *) red "无效的选项，请输入 0 到 7" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
