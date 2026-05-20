@@ -164,6 +164,38 @@ ensure_dependencies() {
     command_exists update-ca-certificates && update-ca-certificates >/dev/null 2>&1 || true
 }
 
+is_working_singbox() {
+    [ -x "$1" ] && "$1" version >/dev/null 2>&1
+}
+
+use_existing_singbox() {
+    local candidate
+
+    for candidate in "${work_dir}/${server_name}" "$(command -v sing-box 2>/dev/null || true)" /usr/local/bin/sing-box /usr/bin/sing-box; do
+        [ -n "$candidate" ] || continue
+        is_working_singbox "$candidate" || continue
+
+        mkdir -p "$work_dir"
+        chmod 755 "$work_dir"
+        if [ "$candidate" != "${work_dir}/${server_name}" ]; then
+            cp "$candidate" "${work_dir}/${server_name}"
+            chmod +x "${work_dir}/${server_name}"
+        fi
+        green "使用本机已安装的 sing-box: $candidate"
+        return 0
+    done
+
+    return 1
+}
+
+install_singbox_from_package() {
+    command_exists apk || return 1
+
+    yellow "未发现可用的本机 sing-box，尝试通过 apk 安装 sing-box..."
+    apk add --no-cache sing-box >/dev/null 2>&1 || return 1
+    use_existing_singbox
+}
+
 detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64) echo "amd64" ;;
@@ -178,6 +210,9 @@ detect_arch() {
 
 install_singbox_binary() {
     local arch latest_version archive tmp_dir source_bin
+
+    use_existing_singbox && return 0
+    install_singbox_from_package && return 0
 
     arch=$(detect_arch)
     mkdir -p "$work_dir"
@@ -208,6 +243,12 @@ install_singbox_binary() {
     mv "$source_bin" "${work_dir}/${server_name}"
     chmod +x "${work_dir}/${server_name}"
     rm -rf "$tmp_dir" "$archive"
+
+    if ! is_working_singbox "${work_dir}/${server_name}"; then
+        red "下载的 sing-box 无法在当前系统执行，请先用系统包管理器安装 sing-box 后重试。"
+        red "Alpine 可尝试执行: apk add --no-cache sing-box"
+        exit 1
+    fi
 }
 
 generate_uuid() {

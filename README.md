@@ -4,7 +4,8 @@
 
 ## 功能
 
-- 仅安装和运行 `sing-box`
+- 优先复用本机已安装且可执行的 `sing-box`
+- 本机没有可用 `sing-box` 时再尝试安装或下载
 - 仅生成 VLESS Reality 配置
 - 支持自定义 Reality 端口和伪装域名/SNI
 - 不安装 nginx

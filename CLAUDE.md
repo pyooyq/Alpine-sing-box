@@ -60,13 +60,14 @@ The install flow is:
 
 1. `run_install_flow` checks whether Reality state and the sing-box binary already exist.
 2. `ensure_dependencies` installs minimal dependencies using the detected package manager.
-3. `install_singbox_binary` downloads the latest sing-box release for the current architecture.
-4. `generate_reality_values` creates UUID, Reality keypair, and short ID.
-5. `write_config` writes `/etc/sing-box/config.json` with a single VLESS Reality inbound and direct outbound.
-6. `save_state` writes `/etc/sing-box/reality.env` for later menu operations.
-7. `install_service` writes either a systemd or OpenRC service and starts sing-box.
-8. `create_shortcut` creates `/usr/bin/sb`, which launches the installed script copy.
-9. `show_reality_info` prints the client parameters and single VLESS link to stdout only.
+3. `install_singbox_binary` first reuses a local working sing-box binary, then tries Alpine `apk add sing-box`, then downloads the latest upstream release.
+4. Downloaded or copied sing-box binaries must pass `sing-box version` before Reality parameters are generated.
+5. `generate_reality_values` creates UUID, Reality keypair, and short ID.
+6. `write_config` writes `/etc/sing-box/config.json` with a single VLESS Reality inbound and direct outbound.
+7. `save_state` writes `/etc/sing-box/reality.env` for later menu operations.
+8. `install_service` writes either a systemd or OpenRC service and starts sing-box.
+9. `create_shortcut` creates `/usr/bin/sb`, which launches the installed script copy.
+10. `show_reality_info` prints the client parameters and single VLESS link to stdout only.
 
 Configuration mutation is handled by `change_port` and `change_reality_domain`, which update `reality.env`, rewrite `config.json`, restart sing-box, and print the updated Reality parameters. Keep `PORT`, `REALITY_DOMAIN`, `UUID`, `PRIVATE_KEY`, `PUBLIC_KEY`, and `SHORT_ID` in sync between state and generated config.
 
