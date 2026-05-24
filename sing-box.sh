@@ -194,8 +194,51 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
     exit 1
 fi
 
+env_unescape() {
+    local value="$1" result="" char next i
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        if [ "$char" = "\\" ] && [ $((i + 1)) -lt "${#value}" ]; then
+            i=$((i + 1))
+            next="${value:i:1}"
+            case "$next" in
+                \\|\"|\$|\`) result="${result}${next}" ;;
+                *) result="${result}\\${next}" ;;
+            esac
+        else
+            result="${result}${char}"
+        fi
+    done
+    printf '%s' "$result"
+}
+
+read_env_value() {
+    local file="$1" key="$2" line value
+    [ -f "$file" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            "$key="*)
+                value=${line#"$key="}
+                if [[ "$value" == \"* ]]; then
+                    value=${value#\"}
+                    value=${value%\"}
+                fi
+                env_unescape "$value"
+                return 0
+                ;;
+        esac
+    done < "$file"
+    return 1
+}
+
 load_state() {
-    [ -f "$state_file" ] && . "$state_file"
+    [ -f "$state_file" ] || return 1
+    PORT=$(read_env_value "$state_file" PORT || true)
+    REALITY_DOMAIN=$(read_env_value "$state_file" REALITY_DOMAIN || true)
+    PRIVATE_KEY=$(read_env_value "$state_file" PRIVATE_KEY || true)
+    PUBLIC_KEY=$(read_env_value "$state_file" PUBLIC_KEY || true)
+    SHORT_ID=$(read_env_value "$state_file" SHORT_ID || true)
+    UUID=$(read_env_value "$state_file" UUID || true)
 }
 
 save_state() {
@@ -246,13 +289,57 @@ validate_new_outbound_tag() {
     [ -n "$tag" ] || { red "tag 不能为空"; return 1; }
     [ "$tag" != "$direct_outbound_tag" ] && [ "$tag" != "$block_outbound_tag" ] || { red "不能使用内置 tag: $tag"; return 1; }
     outbound_exists "$tag" && { red "outbound 已存在: $tag"; return 1; }
+    return 0
 }
 
 load_user_file() {
-    NAME="" UUID="" FLOW="$default_flow" OUTBOUND_TAG="$direct_outbound_tag"
-    . "$1"
+    local file="$1"
+    [ -f "$file" ] || return 1
+    case "$file" in
+        "$users_dir"/*.env) ;;
+        *) return 1 ;;
+    esac
+    NAME=$(read_env_value "$file" NAME || true)
+    UUID=$(read_env_value "$file" UUID || true)
+    FLOW=$(read_env_value "$file" FLOW || true)
+    OUTBOUND_TAG=$(read_env_value "$file" OUTBOUND_TAG || true)
     FLOW="${FLOW:-$default_flow}"
     OUTBOUND_TAG="${OUTBOUND_TAG:-$direct_outbound_tag}"
+}
+
+load_outbound_file() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    case "$file" in
+        "$outbounds_dir"/*.env) ;;
+        *) return 1 ;;
+    esac
+    TAG=$(read_env_value "$file" TAG || true)
+    TYPE=$(read_env_value "$file" TYPE || true)
+    DISPLAY_NAME=$(read_env_value "$file" DISPLAY_NAME || true)
+    SERVER=$(read_env_value "$file" SERVER || true)
+    SERVER_PORT=$(read_env_value "$file" SERVER_PORT || true)
+    USERNAME=$(read_env_value "$file" USERNAME || true)
+    PASSWORD=$(read_env_value "$file" PASSWORD || true)
+    METHOD=$(read_env_value "$file" METHOD || true)
+    PLUGIN=$(read_env_value "$file" PLUGIN || true)
+    PLUGIN_OPTS=$(read_env_value "$file" PLUGIN_OPTS || true)
+    OUT_UUID=$(read_env_value "$file" OUT_UUID || true)
+    UUID=$(read_env_value "$file" UUID || true)
+    FLOW=$(read_env_value "$file" FLOW || true)
+    NETWORK=$(read_env_value "$file" NETWORK || true)
+    TLS_ENABLED=$(read_env_value "$file" TLS_ENABLED || true)
+    TLS_SERVER_NAME=$(read_env_value "$file" TLS_SERVER_NAME || true)
+    TLS_INSECURE=$(read_env_value "$file" TLS_INSECURE || true)
+    REALITY_ENABLED=$(read_env_value "$file" REALITY_ENABLED || true)
+    REALITY_PUBLIC_KEY=$(read_env_value "$file" REALITY_PUBLIC_KEY || true)
+    REALITY_SHORT_ID=$(read_env_value "$file" REALITY_SHORT_ID || true)
+    UTLS_FINGERPRINT=$(read_env_value "$file" UTLS_FINGERPRINT || true)
+    OUT_UUID="${OUT_UUID:-${UUID:-}}"
+    NETWORK="${NETWORK:-tcp}"
+    TLS_ENABLED="${TLS_ENABLED:-0}"
+    TLS_INSECURE="${TLS_INSECURE:-0}"
+    REALITY_ENABLED="${REALITY_ENABLED:-0}"
 }
 
 save_user() {
@@ -553,17 +640,25 @@ render_outbound_json() {
 
     for file in "$outbounds_dir"/*.env; do
         [ -f "$file" ] || continue
-        TAG="" TYPE="" DISPLAY_NAME="" SERVER="" SERVER_PORT="" USERNAME="" PASSWORD="" METHOD="" PLUGIN="" PLUGIN_OPTS="" OUT_UUID="" FLOW="" NETWORK="tcp" TLS_ENABLED="0" TLS_SERVER_NAME="" TLS_INSECURE="0" REALITY_ENABLED="0" REALITY_PUBLIC_KEY="" REALITY_SHORT_ID="" UTLS_FINGERPRINT=""
-        UUID=""
-        . "$file"
+        load_outbound_file "$file" || continue
         tag="$TAG"
         type="$TYPE"
         server="$SERVER"
         server_port="$SERVER_PORT"
         [ -n "$tag" ] && [ -n "$type" ] || continue
         case "$type" in
-            socks|shadowsocks|vless) ;;
-            *) continue ;;
+            socks)
+                [ -n "$server" ] && validate_port "$server_port" || continue
+                ;;
+            shadowsocks)
+                [ -n "$server" ] && [ -n "$METHOD" ] && [ -n "$PASSWORD" ] && validate_port "$server_port" || continue
+                ;;
+            vless)
+                [ -n "$server" ] && [ -n "$OUT_UUID" ] && validate_port "$server_port" || continue
+                ;;
+            *)
+                continue
+                ;;
         esac
         printf ',\n'
         case "$type" in
@@ -591,15 +686,14 @@ render_outbound_json() {
                 printf '\n    }'
                 ;;
             vless)
-                local outbound_uuid="${OUT_UUID:-${UUID:-}}" network="${NETWORK:-tcp}"
                 printf '    {\n'
                 printf '      "type": "vless",\n'
                 printf '      "tag": %s,\n' "$(json_string "$tag")"
                 printf '      "server": %s,\n' "$(json_string "$server")"
                 printf '      "server_port": %s,\n' "$server_port"
-                printf '      "uuid": %s' "$(json_string "$outbound_uuid")"
+                printf '      "uuid": %s' "$(json_string "$OUT_UUID")"
                 [ -n "$FLOW" ] && printf ',\n      "flow": %s' "$(json_string "$FLOW")"
-                printf ',\n      "network": %s' "$(json_string "$network")"
+                printf ',\n      "network": %s' "$(json_string "$NETWORK")"
                 if [ "$TLS_ENABLED" = "1" ]; then
                     printf ',\n      "tls": {\n        "enabled": true'
                     [ -n "$TLS_SERVER_NAME" ] && printf ',\n        "server_name": %s' "$(json_string "$TLS_SERVER_NAME")"
@@ -707,27 +801,33 @@ EOF
 
 apply_config() {
     write_config || return 1
-    restart_singbox || return 1
+    restart_singbox || return 2
 }
 
 apply_config_or_remove() {
-    local file="$1"
-    if ! apply_config; then
+    local file="$1" status
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
         rm -f "$file"
         write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
 }
 
 apply_config_or_restore() {
-    local target="$1" backup="$2"
-    if ! apply_config; then
+    local target="$1" backup="$2" status
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
         if [ -f "$backup" ]; then
             mv "$backup" "$target"
         else
             rm -f "$target"
         fi
         write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
     rm -f "$backup"
@@ -855,10 +955,10 @@ get_server_ip() {
 }
 
 user_link() {
-    local uuid="$1" name="$2" server_ip="$3" link
+    local uuid="$1" name="$2" flow="$3" server_ip="$4" link
     load_state
     [ -n "$server_ip" ] || server_ip=$(get_server_ip)
-    link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
+    link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${flow:-$default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
     printf '%s' "$link"
 }
 
@@ -868,8 +968,8 @@ list_outbounds() {
     purple "direct | 本机直连 | 内置"
     for file in "$outbounds_dir"/*.env; do
         [ -f "$file" ] || continue
-        TAG="" TYPE="" DISPLAY_NAME="" SERVER="" SERVER_PORT=""
-        . "$file"
+        load_outbound_file "$file" || continue
+        [ -n "$TAG" ] && [ -n "$TYPE" ] || continue
         purple "${TAG} | ${TYPE} | ${DISPLAY_NAME:-$SERVER:$SERVER_PORT}"
     done
 }
@@ -880,6 +980,7 @@ list_users() {
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
+        [ -n "$NAME" ] && [ -n "$UUID" ] || continue
         purple "${NAME} | ${UUID} | outbound=${OUTBOUND_TAG}"
     done
 }
@@ -905,7 +1006,8 @@ show_reality_info() {
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
-        link=$(user_link "$UUID" "$NAME" "$server_ip")
+        [ -n "$UUID" ] || continue
+        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip")
         purple "${NAME} -> ${OUTBOUND_TAG}"
         purple "$link\n"
     done
@@ -993,7 +1095,7 @@ change_port() {
     load_state
     [ -n "${PORT:-}" ] || { yellow "尚未安装。"; return 1; }
 
-    local new_port old_port
+    local new_port old_port status
     old_port="$PORT"
     reading "请输入新的 Reality 端口（回车随机）: " new_port
     [ -n "$new_port" ] || new_port=$(random_port)
@@ -1006,11 +1108,13 @@ change_port() {
 
     PORT="$new_port"
     save_state
-    if ! apply_config; then
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
         PORT="$old_port"
         save_state
         write_config >/dev/null 2>&1 || true
-        restart_singbox >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
     allow_port "$PORT"
@@ -1021,7 +1125,7 @@ change_reality_domain() {
     load_state
     [ -n "${REALITY_DOMAIN:-}" ] || { yellow "尚未安装。"; return 1; }
 
-    local new_domain old_domain
+    local new_domain old_domain status
     old_domain="$REALITY_DOMAIN"
     reading "请输入新的 Reality 伪装域名/SNI: " new_domain
     validate_domain "$new_domain" || { red "域名不能为空，且不能包含空格或引号。"; return 1; }
@@ -1033,11 +1137,13 @@ change_reality_domain() {
     fi
 
     save_state
-    if ! apply_config; then
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
         REALITY_DOMAIN="$old_domain"
         save_state
         write_config >/dev/null 2>&1 || true
-        restart_singbox >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
     show_reality_info
@@ -1049,8 +1155,7 @@ select_outbound_tag() {
     local options=("$direct_outbound_tag") labels=("${direct_outbound_tag} | 本机直连") file index choice
     for file in "$outbounds_dir"/*.env; do
         [ -f "$file" ] || continue
-        TAG="" TYPE="" DISPLAY_NAME=""
-        . "$file"
+        load_outbound_file "$file" || continue
         [ -n "$TAG" ] || continue
         options+=("$TAG")
         labels+=("${TAG} | ${TYPE} | ${DISPLAY_NAME:-$TAG}")
@@ -1084,7 +1189,7 @@ add_user_with_outbound() {
     save_user "$name" "$uuid" "$outbound_tag"
     apply_config_or_remove "$(user_file "$name")" || return 1
     green "用户已添加：${name} -> ${outbound_tag}"
-    purple "$(user_link "$uuid" "$name")\n"
+    purple "$(user_link "$uuid" "$name" "$default_flow")\n"
 }
 
 change_user_outbound() {
@@ -1121,7 +1226,7 @@ show_one_user_link() {
     file=$(user_file "$name")
     [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
     load_user_file "$file"
-    purple "$(user_link "$UUID" "$NAME")\n"
+    purple "$(user_link "$UUID" "$NAME" "$FLOW")\n"
 }
 
 delete_user() {
