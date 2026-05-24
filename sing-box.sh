@@ -22,14 +22,22 @@ server_name="sing-box"
 work_dir="/etc/sing-box"
 config_dir="${work_dir}/config.json"
 state_file="${work_dir}/reality.env"
+users_dir="${work_dir}/users.d"
+outbounds_dir="${work_dir}/outbounds.d"
 installed_script="${work_dir}/sb.sh"
 reality_domain="cas-bridge.xethub.hf.co"
 vless_port=""
 auto_install=0
+reality_inbound_tag="reality-in"
+direct_outbound_tag="direct"
+block_outbound_tag="block"
+default_user_name="default-direct"
+default_flow="xtls-rprx-vision"
+default_fingerprint="chrome"
 
 usage() {
     cat << EOF
-sing-box Reality-only 安装脚本
+sing-box Reality 中转/本机节点管理脚本
 
 用法:
   bash sing-box.sh                         进入菜单
@@ -66,6 +74,87 @@ random_port() {
     local n
     n=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
     echo $((20000 + n % 45001))
+}
+
+trim() {
+    printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+sanitize_tag() {
+    local value
+    value=$(trim "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]/-/g;s/--*/-/g;s/^-//;s/-$//')
+    [ -n "$value" ] || value="item-$(date +%s)"
+    printf '%s' "$value"
+}
+
+json_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/}
+    value=${value//$'\t'/\\t}
+    printf '%s' "$value"
+}
+
+json_string() {
+    printf '"%s"' "$(json_escape "$1")"
+}
+
+env_escape() {
+    local value="$1"
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//\$/\\\$}
+    value=${value//\`/\\\`}
+    value=${value//$'\n'/}
+    value=${value//$'\r'/}
+    printf '%s' "$value"
+}
+
+write_env_line() {
+    printf '%s="%s"\n' "$1" "$(env_escape "$2")"
+}
+
+url_decode() {
+    local value="${1//+/ }"
+    printf '%b' "${value//%/\\x}" 2>/dev/null || printf '%s' "$1"
+}
+
+b64_decode() {
+    local value padding decoded
+    value=$(trim "$1")
+    value=${value//-/+}
+    value=${value//_/\/}
+    padding=$(( (4 - ${#value} % 4) % 4 ))
+    value="${value}$(printf '%*s' "$padding" '' | tr ' ' '=')"
+
+    if decoded=$(printf '%s' "$value" | base64 -d 2>/dev/null); then
+        [ -n "$decoded" ] || return 1
+        printf '%s' "$decoded"
+        return 0
+    fi
+
+    if decoded=$(printf '%s' "$value" | base64 --decode 2>/dev/null); then
+        [ -n "$decoded" ] || return 1
+        printf '%s' "$decoded"
+        return 0
+    fi
+
+    return 1
+}
+
+get_query_param() {
+    local query="$1" key="$2" pair name value
+    IFS='&' read -ra pairs <<< "$query"
+    for pair in "${pairs[@]}"; do
+        name=${pair%%=*}
+        value=${pair#*=}
+        [ "$name" = "$key" ] || continue
+        url_decode "$value"
+        return 0
+    done
+    return 1
 }
 
 while [ $# -gt 0 ]; do
@@ -110,15 +199,168 @@ load_state() {
 }
 
 save_state() {
-    cat > "$state_file" << EOF
-PORT="$PORT"
-REALITY_DOMAIN="$REALITY_DOMAIN"
-UUID="$UUID"
-PRIVATE_KEY="$PRIVATE_KEY"
-PUBLIC_KEY="$PUBLIC_KEY"
-SHORT_ID="$SHORT_ID"
-EOF
+    mkdir -p "$work_dir"
+    {
+        write_env_line PORT "${PORT:-}"
+        write_env_line REALITY_DOMAIN "${REALITY_DOMAIN:-}"
+        write_env_line PRIVATE_KEY "${PRIVATE_KEY:-}"
+        write_env_line PUBLIC_KEY "${PUBLIC_KEY:-}"
+        write_env_line SHORT_ID "${SHORT_ID:-}"
+    } > "$state_file"
     chmod 600 "$state_file"
+}
+
+ensure_state_layout() {
+    mkdir -p "$work_dir" "$users_dir" "$outbounds_dir"
+    chmod 755 "$work_dir"
+    chmod 700 "$users_dir" "$outbounds_dir"
+}
+
+user_file() {
+    printf '%s/%s.env' "$users_dir" "$(sanitize_tag "$1")"
+}
+
+outbound_file() {
+    printf '%s/%s.env' "$outbounds_dir" "$(sanitize_tag "$1")"
+}
+
+has_users() {
+    local file
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] && return 0
+    done
+    return 1
+}
+
+user_exists() {
+    [ -f "$(user_file "$1")" ]
+}
+
+outbound_exists() {
+    { [ "$1" = "$direct_outbound_tag" ] || [ "$1" = "$block_outbound_tag" ]; } && return 0
+    [ -f "$(outbound_file "$1")" ]
+}
+
+validate_new_outbound_tag() {
+    local tag="$1"
+    [ -n "$tag" ] || { red "tag 不能为空"; return 1; }
+    [ "$tag" != "$direct_outbound_tag" ] && [ "$tag" != "$block_outbound_tag" ] || { red "不能使用内置 tag: $tag"; return 1; }
+    outbound_exists "$tag" && { red "outbound 已存在: $tag"; return 1; }
+}
+
+load_user_file() {
+    NAME="" UUID="" FLOW="$default_flow" OUTBOUND_TAG="$direct_outbound_tag"
+    . "$1"
+    FLOW="${FLOW:-$default_flow}"
+    OUTBOUND_TAG="${OUTBOUND_TAG:-$direct_outbound_tag}"
+}
+
+save_user() {
+    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" file
+    name=$(sanitize_tag "$name")
+    file=$(user_file "$name")
+    {
+        write_env_line NAME "$name"
+        write_env_line UUID "$uuid"
+        write_env_line FLOW "$flow"
+        write_env_line OUTBOUND_TAG "$outbound_tag"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+save_socks_outbound() {
+    local tag="$1" display_name="$2" server="$3" server_port="$4" username="$5" password="$6" file
+    tag=$(sanitize_tag "$tag")
+    file=$(outbound_file "$tag")
+    {
+        write_env_line TAG "$tag"
+        write_env_line TYPE "socks"
+        write_env_line DISPLAY_NAME "$display_name"
+        write_env_line SERVER "$server"
+        write_env_line SERVER_PORT "$server_port"
+        write_env_line USERNAME "$username"
+        write_env_line PASSWORD "$password"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+save_shadowsocks_outbound() {
+    local tag="$1" display_name="$2" server="$3" server_port="$4" method="$5" password="$6" plugin="$7" plugin_opts="$8" file
+    tag=$(sanitize_tag "$tag")
+    file=$(outbound_file "$tag")
+    {
+        write_env_line TAG "$tag"
+        write_env_line TYPE "shadowsocks"
+        write_env_line DISPLAY_NAME "$display_name"
+        write_env_line SERVER "$server"
+        write_env_line SERVER_PORT "$server_port"
+        write_env_line METHOD "$method"
+        write_env_line PASSWORD "$password"
+        write_env_line PLUGIN "$plugin"
+        write_env_line PLUGIN_OPTS "$plugin_opts"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+save_vless_outbound() {
+    local tag="$1" display_name="$2" server="$3" server_port="$4" uuid="$5" flow="$6" network="$7" tls_enabled="$8" tls_server_name="$9" tls_insecure="${10}" reality_enabled="${11}" reality_public_key="${12}" reality_short_id="${13}" utls_fingerprint="${14}" file
+    tag=$(sanitize_tag "$tag")
+    file=$(outbound_file "$tag")
+    {
+        write_env_line TAG "$tag"
+        write_env_line TYPE "vless"
+        write_env_line DISPLAY_NAME "$display_name"
+        write_env_line SERVER "$server"
+        write_env_line SERVER_PORT "$server_port"
+        write_env_line UUID "$uuid"
+        write_env_line FLOW "$flow"
+        write_env_line NETWORK "${network:-tcp}"
+        write_env_line TLS_ENABLED "${tls_enabled:-0}"
+        write_env_line TLS_SERVER_NAME "$tls_server_name"
+        write_env_line TLS_INSECURE "${tls_insecure:-0}"
+        write_env_line REALITY_ENABLED "${reality_enabled:-0}"
+        write_env_line REALITY_PUBLIC_KEY "$reality_public_key"
+        write_env_line REALITY_SHORT_ID "$reality_short_id"
+        write_env_line UTLS_FINGERPRINT "$utls_fingerprint"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+migrate_legacy_state() {
+    load_state
+
+    [ -f "$state_file" ] || return 1
+    [ -n "${PORT:-}" ] && [ -n "${REALITY_DOMAIN:-}" ] && [ -n "${PRIVATE_KEY:-}" ] && [ -n "${PUBLIC_KEY:-}" ] && [ -n "${SHORT_ID:-}" ] || return 1
+
+    ensure_state_layout
+    if ! has_users; then
+        local legacy_uuid="${UUID:-}"
+        [ -n "$legacy_uuid" ] || legacy_uuid=$(generate_uuid)
+        save_user "$default_user_name" "$legacy_uuid" "$direct_outbound_tag"
+    fi
+}
+
+require_reality_state() {
+    migrate_legacy_state || {
+        yellow "尚未安装，请先选择 1 安装 / 初始化 Reality 节点。"
+        return 1
+    }
+}
+
+validate_config_file() {
+    local file="$1" check_output
+
+    is_working_singbox "${work_dir}/${server_name}" || return 0
+    check_output=$("${work_dir}/${server_name}" check -c "$file" 2>&1) && return 0
+
+    if printf '%s' "$check_output" | grep -qiE 'unknown command|unknown flag|flag provided but not defined|No help topic'; then
+        yellow "当前 sing-box 不支持 check -c，跳过配置预校验。"
+        return 0
+    fi
+
+    red "sing-box 配置校验失败："
+    red "$check_output"
+    return 1
 }
 
 check_singbox() {
@@ -220,7 +462,6 @@ install_singbox_binary() {
 
     use_existing_singbox && return 0
     install_singbox_from_package && return 0
-
     ensure_alpine_compat
 
     arch=$(detect_arch)
@@ -275,20 +516,142 @@ generate_uuid() {
 generate_reality_values() {
     local output
 
-    UUID=$(generate_uuid)
     output=$("${work_dir}/${server_name}" generate reality-keypair)
     PRIVATE_KEY=$(echo "$output" | awk '/PrivateKey:/ {print $2}')
     PUBLIC_KEY=$(echo "$output" | awk '/PublicKey:/ {print $2}')
     SHORT_ID=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
 
-    [ -n "$UUID" ] && [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] && [ -n "$SHORT_ID" ] || {
+    [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] && [ -n "$SHORT_ID" ] || {
         red "生成 Reality 参数失败"
         exit 1
     }
 }
 
+render_inbound_users_json() {
+    local file first=1 name uuid flow
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        name="$NAME"
+        uuid="$UUID"
+        flow="$FLOW"
+        [ -n "$name" ] && [ -n "$uuid" ] || continue
+        [ "$first" -eq 1 ] || printf ',\n'
+        first=0
+        printf '        {\n'
+        printf '          "name": %s,\n' "$(json_string "$name")"
+        printf '          "uuid": %s,\n' "$(json_string "$uuid")"
+        printf '          "flow": %s\n' "$(json_string "$flow")"
+        printf '        }'
+    done
+}
+
+render_outbound_json() {
+    local file first=0 tag type display server server_port username password method plugin plugin_opts
+    printf '    {\n      "type": "direct",\n      "tag": %s\n    },\n' "$(json_string "$direct_outbound_tag")"
+    printf '    {\n      "type": "block",\n      "tag": %s\n    }' "$(json_string "$block_outbound_tag")"
+
+    for file in "$outbounds_dir"/*.env; do
+        [ -f "$file" ] || continue
+        TAG="" TYPE="" DISPLAY_NAME="" SERVER="" SERVER_PORT="" USERNAME="" PASSWORD="" METHOD="" PLUGIN="" PLUGIN_OPTS="" OUT_UUID="" FLOW="" NETWORK="tcp" TLS_ENABLED="0" TLS_SERVER_NAME="" TLS_INSECURE="0" REALITY_ENABLED="0" REALITY_PUBLIC_KEY="" REALITY_SHORT_ID="" UTLS_FINGERPRINT=""
+        UUID=""
+        . "$file"
+        tag="$TAG"
+        type="$TYPE"
+        server="$SERVER"
+        server_port="$SERVER_PORT"
+        [ -n "$tag" ] && [ -n "$type" ] || continue
+        case "$type" in
+            socks|shadowsocks|vless) ;;
+            *) continue ;;
+        esac
+        printf ',\n'
+        case "$type" in
+            socks)
+                printf '    {\n'
+                printf '      "type": "socks",\n'
+                printf '      "tag": %s,\n' "$(json_string "$tag")"
+                printf '      "server": %s,\n' "$(json_string "$server")"
+                printf '      "server_port": %s,\n' "$server_port"
+                printf '      "version": "5"'
+                [ -n "$USERNAME" ] && printf ',\n      "username": %s' "$(json_string "$USERNAME")"
+                [ -n "$PASSWORD" ] && printf ',\n      "password": %s' "$(json_string "$PASSWORD")"
+                printf '\n    }'
+                ;;
+            shadowsocks)
+                printf '    {\n'
+                printf '      "type": "shadowsocks",\n'
+                printf '      "tag": %s,\n' "$(json_string "$tag")"
+                printf '      "server": %s,\n' "$(json_string "$server")"
+                printf '      "server_port": %s,\n' "$server_port"
+                printf '      "method": %s,\n' "$(json_string "$METHOD")"
+                printf '      "password": %s' "$(json_string "$PASSWORD")"
+                [ -n "$PLUGIN" ] && printf ',\n      "plugin": %s' "$(json_string "$PLUGIN")"
+                [ -n "$PLUGIN_OPTS" ] && printf ',\n      "plugin_opts": %s' "$(json_string "$PLUGIN_OPTS")"
+                printf '\n    }'
+                ;;
+            vless)
+                local outbound_uuid="${OUT_UUID:-${UUID:-}}" network="${NETWORK:-tcp}"
+                printf '    {\n'
+                printf '      "type": "vless",\n'
+                printf '      "tag": %s,\n' "$(json_string "$tag")"
+                printf '      "server": %s,\n' "$(json_string "$server")"
+                printf '      "server_port": %s,\n' "$server_port"
+                printf '      "uuid": %s' "$(json_string "$outbound_uuid")"
+                [ -n "$FLOW" ] && printf ',\n      "flow": %s' "$(json_string "$FLOW")"
+                printf ',\n      "network": %s' "$(json_string "$network")"
+                if [ "$TLS_ENABLED" = "1" ]; then
+                    printf ',\n      "tls": {\n        "enabled": true'
+                    [ -n "$TLS_SERVER_NAME" ] && printf ',\n        "server_name": %s' "$(json_string "$TLS_SERVER_NAME")"
+                    [ "$TLS_INSECURE" = "1" ] && printf ',\n        "insecure": true'
+                    if [ -n "$UTLS_FINGERPRINT" ]; then
+                        printf ',\n        "utls": {\n          "enabled": true,\n          "fingerprint": %s\n        }' "$(json_string "$UTLS_FINGERPRINT")"
+                    fi
+                    if [ "$REALITY_ENABLED" = "1" ]; then
+                        printf ',\n        "reality": {\n          "enabled": true,\n          "public_key": %s' "$(json_string "$REALITY_PUBLIC_KEY")"
+                        [ -n "$REALITY_SHORT_ID" ] && printf ',\n          "short_id": %s' "$(json_string "$REALITY_SHORT_ID")"
+                        printf '\n        }'
+                    fi
+                    printf '\n      }'
+                fi
+                printf '\n    }'
+                ;;
+        esac
+    done
+}
+
+render_route_rules_json() {
+    local file first=1 name outbound_tag
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        name="$NAME"
+        outbound_tag="$OUTBOUND_TAG"
+        [ -n "$name" ] || continue
+        [ "$first" -eq 1 ] || printf ',\n'
+        first=0
+        printf '      {\n'
+        printf '        "inbound": [%s],\n' "$(json_string "$reality_inbound_tag")"
+        printf '        "auth_user": [%s],\n' "$(json_string "$name")"
+        printf '        "action": "route",\n'
+        printf '        "outbound": %s\n' "$(json_string "$outbound_tag")"
+        printf '      }'
+    done
+
+    [ "$first" -eq 1 ] || printf ',\n'
+    printf '      {\n'
+    printf '        "inbound": [%s],\n' "$(json_string "$reality_inbound_tag")"
+    printf '        "action": "route",\n'
+    printf '        "outbound": %s\n' "$(json_string "$block_outbound_tag")"
+    printf '      }'
+}
+
 write_config() {
-    cat > "$config_dir" << EOF
+    local tmp_config="${config_dir}.tmp"
+    ensure_state_layout
+    load_state
+
+    cat > "$tmp_config" << EOF
 {
   "log": {
     "level": "warn",
@@ -298,44 +661,76 @@ write_config() {
   "inbounds": [
     {
       "type": "vless",
-      "tag": "reality-in",
+      "tag": "${reality_inbound_tag}",
       "listen": "::",
       "listen_port": ${PORT},
       "users": [
-        {
-          "uuid": "${UUID}",
-          "flow": "xtls-rprx-vision"
-        }
+$(render_inbound_users_json)
       ],
       "tls": {
         "enabled": true,
-        "server_name": "${REALITY_DOMAIN}",
+        "server_name": "$(json_escape "$REALITY_DOMAIN")",
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "${REALITY_DOMAIN}",
+            "server": "$(json_escape "$REALITY_DOMAIN")",
             "server_port": 443
           },
-          "private_key": "${PRIVATE_KEY}",
+          "private_key": "$(json_escape "$PRIVATE_KEY")",
           "short_id": [
-            "${SHORT_ID}"
+            "$(json_escape "$SHORT_ID")"
           ]
         }
       }
     }
   ],
   "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
+$(render_outbound_json)
   ],
   "route": {
-    "final": "direct"
+    "rules": [
+$(render_route_rules_json)
+    ],
+    "final": "${direct_outbound_tag}"
   }
 }
 EOF
+
+    if ! validate_config_file "$tmp_config"; then
+        rm -f "$tmp_config"
+        return 1
+    fi
+
+    mv "$tmp_config" "$config_dir"
     chmod 600 "$config_dir"
+}
+
+apply_config() {
+    write_config || return 1
+    restart_singbox || return 1
+}
+
+apply_config_or_remove() {
+    local file="$1"
+    if ! apply_config; then
+        rm -f "$file"
+        write_config >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+apply_config_or_restore() {
+    local target="$1" backup="$2"
+    if ! apply_config; then
+        if [ -f "$backup" ]; then
+            mv "$backup" "$target"
+        else
+            rm -f "$target"
+        fi
+        write_config >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$backup"
 }
 
 allow_port() {
@@ -459,29 +854,61 @@ get_server_ip() {
     echo "你的服务器IP"
 }
 
+user_link() {
+    local uuid="$1" name="$2" server_ip="$3" link
+    load_state
+    [ -n "$server_ip" ] || server_ip=$(get_server_ip)
+    link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
+    printf '%s' "$link"
+}
+
+list_outbounds() {
+    local file
+    green "\n=== 落地 outbound ==="
+    purple "direct | 本机直连 | 内置"
+    for file in "$outbounds_dir"/*.env; do
+        [ -f "$file" ] || continue
+        TAG="" TYPE="" DISPLAY_NAME="" SERVER="" SERVER_PORT=""
+        . "$file"
+        purple "${TAG} | ${TYPE} | ${DISPLAY_NAME:-$SERVER:$SERVER_PORT}"
+    done
+}
+
+list_users() {
+    local file
+    green "\n=== 入站用户 ==="
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        purple "${NAME} | ${UUID} | outbound=${OUTBOUND_TAG}"
+    done
+}
+
 show_reality_info() {
-    if [ ! -f "$state_file" ]; then
-        yellow "尚未生成 Reality 参数，请先安装。"
-        return 1
-    fi
+    require_reality_state || return 1
 
     load_state
-    local server_ip link
+    local file link server_ip
     server_ip=$(get_server_ip)
-    link="vless://${UUID}@${server_ip}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_DOMAIN}&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#sing-box-reality"
 
     green "\nReality 参数："
     purple "地址: ${server_ip}"
     purple "端口: ${PORT}"
-    purple "UUID: ${UUID}"
-    purple "Flow: xtls-rprx-vision"
     purple "Security: reality"
     purple "SNI/伪装域名: ${REALITY_DOMAIN}"
     purple "PublicKey: ${PUBLIC_KEY}"
     purple "ShortID: ${SHORT_ID}"
-    purple "Fingerprint: chrome"
-    yellow "\n单节点链接仅显示在这里："
-    purple "$link\n"
+    purple "Fingerprint: ${default_fingerprint}"
+
+    list_users
+    yellow "\n用户链接："
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        link=$(user_link "$UUID" "$NAME" "$server_ip")
+        purple "${NAME} -> ${OUTBOUND_TAG}"
+        purple "$link\n"
+    done
 }
 
 show_singbox_logs() {
@@ -537,21 +964,25 @@ EOF
 run_install_flow() {
     if [ -f "$state_file" ] && [ -x "${work_dir}/${server_name}" ]; then
         yellow "sing-box Reality 已安装。"
+        migrate_legacy_state
+        write_config || return 1
         show_reality_info
         create_shortcut
         return 0
     fi
 
     clear
-    purple "正在安装 sing-box Reality-only..."
+    purple "正在安装 sing-box Reality 中转/本机节点..."
     ensure_dependencies
     install_singbox_binary
+    ensure_state_layout
 
     PORT="$vless_port"
     REALITY_DOMAIN="$reality_domain"
     generate_reality_values
-    write_config
     save_state
+    save_user "$default_user_name" "$(generate_uuid)" "$direct_outbound_tag"
+    write_config || exit 1
     allow_port "$PORT"
     install_service
     create_shortcut
@@ -562,16 +993,27 @@ change_port() {
     load_state
     [ -n "${PORT:-}" ] || { yellow "尚未安装。"; return 1; }
 
-    local new_port
+    local new_port old_port
+    old_port="$PORT"
     reading "请输入新的 Reality 端口（回车随机）: " new_port
     [ -n "$new_port" ] || new_port=$(random_port)
     validate_port "$new_port" || { red "端口范围需在 1-65535"; return 1; }
 
+    if [ "$new_port" = "$old_port" ]; then
+        yellow "端口未变化。"
+        return 0
+    fi
+
     PORT="$new_port"
-    write_config
     save_state
+    if ! apply_config; then
+        PORT="$old_port"
+        save_state
+        write_config >/dev/null 2>&1 || true
+        restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
     allow_port "$PORT"
-    restart_singbox
     show_reality_info
 }
 
@@ -579,15 +1021,357 @@ change_reality_domain() {
     load_state
     [ -n "${REALITY_DOMAIN:-}" ] || { yellow "尚未安装。"; return 1; }
 
-    local new_domain
+    local new_domain old_domain
+    old_domain="$REALITY_DOMAIN"
     reading "请输入新的 Reality 伪装域名/SNI: " new_domain
     validate_domain "$new_domain" || { red "域名不能为空，且不能包含空格或引号。"; return 1; }
 
     REALITY_DOMAIN="$new_domain"
-    write_config
+    if [ "$REALITY_DOMAIN" = "$old_domain" ]; then
+        yellow "Reality 伪装域名未变化。"
+        return 0
+    fi
+
     save_state
-    restart_singbox
+    if ! apply_config; then
+        REALITY_DOMAIN="$old_domain"
+        save_state
+        write_config >/dev/null 2>&1 || true
+        restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
     show_reality_info
+}
+
+select_outbound_tag() {
+    require_reality_state || return 1
+
+    local options=("$direct_outbound_tag") labels=("${direct_outbound_tag} | 本机直连") file index choice
+    for file in "$outbounds_dir"/*.env; do
+        [ -f "$file" ] || continue
+        TAG="" TYPE="" DISPLAY_NAME=""
+        . "$file"
+        [ -n "$TAG" ] || continue
+        options+=("$TAG")
+        labels+=("${TAG} | ${TYPE} | ${DISPLAY_NAME:-$TAG}")
+    done
+
+    green "\n请选择 outbound："
+    for index in "${!labels[@]}"; do
+        purple "$((index + 1)). ${labels[$index]}"
+    done
+    reading "请输入编号: " choice
+    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
+    [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ] || return 1
+    SELECTED_OUTBOUND_TAG="${options[$((choice - 1))]}"
+}
+
+add_user_with_outbound() {
+    local name uuid outbound_tag
+    require_reality_state || return 1
+    reading "请输入用户名称（英文/数字，留空自动生成）: " name
+    [ -n "$name" ] || name="user-$(date +%s)"
+    name=$(sanitize_tag "$name")
+    user_exists "$name" && { red "用户已存在: $name"; return 1; }
+
+    if ! select_outbound_tag; then
+        red "未选择有效 outbound。"
+        return 1
+    fi
+
+    outbound_tag="$SELECTED_OUTBOUND_TAG"
+    uuid=$(generate_uuid)
+    save_user "$name" "$uuid" "$outbound_tag"
+    apply_config_or_remove "$(user_file "$name")" || return 1
+    green "用户已添加：${name} -> ${outbound_tag}"
+    purple "$(user_link "$uuid" "$name")\n"
+}
+
+change_user_outbound() {
+    local name file
+    require_reality_state || return 1
+    list_users
+    reading "请输入要修改的用户名称: " name
+    name=$(sanitize_tag "$name")
+    file=$(user_file "$name")
+    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
+
+    if ! select_outbound_tag; then
+        red "未选择有效 outbound。"
+        return 1
+    fi
+
+    load_user_file "$file"
+    if [ "$OUTBOUND_TAG" = "$SELECTED_OUTBOUND_TAG" ]; then
+        yellow "用户 ${NAME} 的 outbound 未变化。"
+        return 0
+    fi
+    cp "$file" "${file}.bak"
+    save_user "$NAME" "$UUID" "$SELECTED_OUTBOUND_TAG" "$FLOW"
+    apply_config_or_restore "$file" "${file}.bak" || return 1
+    green "用户 ${NAME} 已绑定到 ${SELECTED_OUTBOUND_TAG}"
+}
+
+show_one_user_link() {
+    local name file
+    require_reality_state || return 1
+    list_users
+    reading "请输入用户名称: " name
+    name=$(sanitize_tag "$name")
+    file=$(user_file "$name")
+    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
+    load_user_file "$file"
+    purple "$(user_link "$UUID" "$NAME")\n"
+}
+
+delete_user() {
+    local name file count=0 item
+    require_reality_state || return 1
+    list_users
+    reading "请输入要删除的用户名称: " name
+    name=$(sanitize_tag "$name")
+    file=$(user_file "$name")
+    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
+
+    for item in "$users_dir"/*.env; do
+        [ -f "$item" ] && count=$((count + 1))
+    done
+    [ "$count" -gt 1 ] || { red "至少保留一个入站用户。"; return 1; }
+
+    mv "$file" "${file}.bak"
+    apply_config_or_restore "$file" "${file}.bak" || return 1
+    green "用户已删除：$name"
+}
+
+manage_users_menu() {
+    local choice
+    require_reality_state || return 1
+    clear
+    green "=== 入站用户管理 ===\n"
+    green "1. 列出用户"
+    green "2. 添加用户并绑定 outbound"
+    green "3. 查看用户链接"
+    green "4. 修改用户绑定 outbound"
+    red "5. 删除用户"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " choice
+
+    case "$choice" in
+        1) list_users ;;
+        2) add_user_with_outbound ;;
+        3) show_one_user_link ;;
+        4) change_user_outbound ;;
+        5) delete_user ;;
+        0) return ;;
+        *) red "无效的选项" ;;
+    esac
+}
+
+add_socks_outbound() {
+    local tag display_name server server_port username password
+    require_reality_state || return 1
+    reading "请输入落地 tag（英文/数字）: " tag
+    tag=$(sanitize_tag "$tag")
+    validate_new_outbound_tag "$tag" || return 1
+    reading "请输入显示名称（可留空）: " display_name
+    [ -n "$display_name" ] || display_name="$tag"
+    reading "请输入 SOCKS5 服务器地址: " server
+    [ -n "$server" ] || { red "服务器不能为空"; return 1; }
+    reading "请输入 SOCKS5 端口: " server_port
+    validate_port "$server_port" || { red "端口范围需在 1-65535"; return 1; }
+    reading "请输入 SOCKS5 用户名: " username
+    reading "请输入 SOCKS5 密码: " password
+
+    save_socks_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password"
+    apply_config_or_remove "$(outbound_file "$tag")" || return 1
+    green "SOCKS5 落地已添加：$tag"
+}
+
+decode_import_input() {
+    local input="$1" decoded
+    input=$(trim "$input")
+    if [[ "$input" == ss://* || "$input" == vless://* ]]; then
+        printf '%s' "$input"
+        return 0
+    fi
+    decoded=$(b64_decode "$input") || return 1
+    decoded=$(trim "$decoded")
+    if [[ "$decoded" == ss://* || "$decoded" == vless://* ]]; then
+        printf '%s' "$decoded"
+        return 0
+    fi
+    return 1
+}
+
+parse_common_uri() {
+    PARSED_URI=$(decode_import_input "$1") || return 1
+    PARSED_BODY=${PARSED_URI#*://}
+    PARSED_FRAGMENT=""
+    PARSED_QUERY=""
+
+    if [[ "$PARSED_BODY" == *#* ]]; then
+        PARSED_FRAGMENT=${PARSED_BODY#*#}
+        PARSED_BODY=${PARSED_BODY%%#*}
+        PARSED_FRAGMENT=$(url_decode "$PARSED_FRAGMENT")
+    fi
+
+    if [[ "$PARSED_BODY" == *\?* ]]; then
+        PARSED_QUERY=${PARSED_BODY#*\?}
+        PARSED_BODY=${PARSED_BODY%%\?*}
+    fi
+}
+
+import_shadowsocks_outbound() {
+    local input uri body fragment query main userinfo hostport decoded method password server server_port plugin plugin_opts tag display_name
+    require_reality_state || return 1
+    reading "请输入 ss:// 链接或其 base64: " input
+    parse_common_uri "$input" || { red "无法解析 SS 导入内容。"; return 1; }
+    uri="$PARSED_URI"
+    body="$PARSED_BODY"
+    query="$PARSED_QUERY"
+    fragment="$PARSED_FRAGMENT"
+    [[ "$uri" == ss://* ]] || { red "导入内容不是 ss://"; return 1; }
+
+    main="$body"
+    if [[ "$main" == *@* ]]; then
+        userinfo=${main%@*}
+        hostport=${main#*@}
+        decoded=$(b64_decode "$userinfo" || printf '%s' "$userinfo")
+        method=${decoded%%:*}
+        password=${decoded#*:}
+        server=${hostport%:*}
+        server_port=${hostport##*:}
+    else
+        decoded=$(b64_decode "$main") || { red "SS 主体 base64 解析失败。"; return 1; }
+        method=${decoded%%:*}
+        decoded=${decoded#*:}
+        password=${decoded%@*}
+        hostport=${decoded#*@}
+        server=${hostport%:*}
+        server_port=${hostport##*:}
+    fi
+
+    validate_port "$server_port" || { red "SS 端口无效。"; return 1; }
+    [ -n "$method" ] && [ -n "$password" ] && [ -n "$server" ] || { red "SS 链接缺少 method、password 或 server。"; return 1; }
+    plugin=$(get_query_param "$query" "plugin" || true)
+    plugin_opts=""
+    if [ -n "$plugin" ] && [[ "$plugin" == *\;* ]]; then
+        plugin_opts=${plugin#*;}
+        plugin=${plugin%%;*}
+    fi
+
+    reading "请输入落地 tag（留空使用链接名称）: " tag
+    [ -n "$tag" ] || tag="${fragment:-ss-$(date +%s)}"
+    tag=$(sanitize_tag "$tag")
+    validate_new_outbound_tag "$tag" || return 1
+    display_name="${fragment:-$tag}"
+    save_shadowsocks_outbound "$tag" "$display_name" "$server" "$server_port" "$method" "$password" "$plugin" "$plugin_opts"
+    apply_config_or_remove "$(outbound_file "$tag")" || return 1
+    green "SS 落地已导入：$tag"
+}
+
+import_vless_outbound() {
+    local input uri body fragment query main hostport security tag display_name outbound_uuid server server_port flow network tls_enabled tls_server_name tls_insecure reality_enabled reality_public_key reality_short_id utls_fingerprint
+    require_reality_state || return 1
+    reading "请输入 vless:// 链接或其 base64: " input
+    parse_common_uri "$input" || { red "无法解析 VLESS 导入内容。"; return 1; }
+    uri="$PARSED_URI"
+    body="$PARSED_BODY"
+    query="$PARSED_QUERY"
+    fragment="$PARSED_FRAGMENT"
+    [[ "$uri" == vless://* ]] || { red "导入内容不是 vless://"; return 1; }
+
+    main="$body"
+    outbound_uuid=${main%@*}
+    hostport=${main#*@}
+    server=${hostport%:*}
+    server_port=${hostport##*:}
+    [ -n "$outbound_uuid" ] && [ -n "$server" ] || { red "VLESS 链接缺少 UUID 或服务器地址。"; return 1; }
+    validate_port "$server_port" || { red "VLESS 端口无效。"; return 1; }
+
+    flow=$(get_query_param "$query" "flow" || true)
+    network=$(get_query_param "$query" "type" || true)
+    [ -n "$network" ] || network="tcp"
+    security=$(get_query_param "$query" "security" || true)
+    tls_server_name=$(get_query_param "$query" "sni" || true)
+    utls_fingerprint=$(get_query_param "$query" "fp" || true)
+    tls_insecure=$(get_query_param "$query" "allowInsecure" || true)
+    [ "$tls_insecure" = "1" ] || [ "$tls_insecure" = "true" ] && tls_insecure=1 || tls_insecure=0
+    reality_public_key=$(get_query_param "$query" "pbk" || true)
+    reality_short_id=$(get_query_param "$query" "sid" || true)
+    tls_enabled=0
+    reality_enabled=0
+    if [ "$security" = "tls" ] || [ "$security" = "reality" ]; then
+        tls_enabled=1
+    fi
+    if [ "$security" = "reality" ]; then
+        reality_enabled=1
+        [ -n "$reality_public_key" ] || { red "Reality VLESS 链接缺少 pbk。"; return 1; }
+    fi
+
+    if [ "$network" != "tcp" ]; then
+        red "当前首版仅支持导入 VLESS TCP 出站，请改用 TCP 链接或手动配置。"
+        return 1
+    fi
+
+    reading "请输入落地 tag（留空使用链接名称）: " tag
+    [ -n "$tag" ] || tag="${fragment:-vless-$(date +%s)}"
+    tag=$(sanitize_tag "$tag")
+    validate_new_outbound_tag "$tag" || return 1
+    display_name="${fragment:-$tag}"
+    save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "$reality_enabled" "$reality_public_key" "$reality_short_id" "$utls_fingerprint"
+    apply_config_or_remove "$(outbound_file "$tag")" || return 1
+    green "VLESS 落地已导入：$tag"
+}
+
+outbound_in_use() {
+    local tag="$1" file
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        [ "$OUTBOUND_TAG" = "$tag" ] && { printf '%s' "$NAME"; return 0; }
+    done
+    return 1
+}
+
+delete_outbound() {
+    local tag user file
+    require_reality_state || return 1
+    list_outbounds
+    reading "请输入要删除的落地 tag: " tag
+    tag=$(sanitize_tag "$tag")
+    [ "$tag" != "$direct_outbound_tag" ] && [ "$tag" != "$block_outbound_tag" ] || { red "不能删除内置 outbound: $tag"; return 1; }
+    file=$(outbound_file "$tag")
+    [ -f "$file" ] || { red "outbound 不存在: $tag"; return 1; }
+    user=$(outbound_in_use "$tag" || true)
+    [ -z "$user" ] || { red "outbound 正被用户 ${user} 使用，不能删除。"; return 1; }
+    mv "$file" "${file}.bak"
+    apply_config_or_restore "$file" "${file}.bak" || return 1
+    green "outbound 已删除：$tag"
+}
+
+manage_outbounds_menu() {
+    local choice
+    require_reality_state || return 1
+    clear
+    green "=== 落地 outbound 管理 ===\n"
+    green "1. 列出落地"
+    green "2. 添加 SOCKS5 落地"
+    green "3. 导入 SS 落地"
+    green "4. 导入 VLESS 落地"
+    red "5. 删除落地"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " choice
+
+    case "$choice" in
+        1) list_outbounds ;;
+        2) add_socks_outbound ;;
+        3) import_shadowsocks_outbound ;;
+        4) import_vless_outbound ;;
+        5) delete_outbound ;;
+        0) return ;;
+        *) red "无效的选项" ;;
+    esac
 }
 
 manage_singbox() {
@@ -616,7 +1400,7 @@ manage_singbox() {
 
 uninstall_singbox() {
     local choice
-    reading "确定要卸载 sing-box Reality 并删除 ${work_dir} 吗？(y/n): " choice
+    reading "确定要卸载 sing-box 并删除 ${work_dir} 吗？(y/n): " choice
     case "$choice" in
         y|Y)
             yellow "正在卸载 sing-box..."
@@ -646,17 +1430,19 @@ menu() {
     singbox_status=$(check_singbox 2>/dev/null)
 
     clear
-    purple "=== sing-box Reality-only 脚本 ===\n"
+    purple "=== sing-box Reality 中转/本机节点脚本 ===\n"
     purple "sing-box 状态: ${singbox_status}\n"
-    green "1. 安装 sing-box Reality"
-    green "2. 查看 Reality 参数"
-    green "3. 修改 Reality 端口"
-    green "4. 修改 Reality 伪装域名"
-    green "5. sing-box 服务管理"
-    green "6. 查看 sing-box 日志"
-    red "7. 卸载 sing-box"
+    green "1. 安装 / 初始化 Reality 节点"
+    green "2. 查看 Reality 用户和落地摘要"
+    green "3. 管理入站用户"
+    green "4. 管理落地 outbound"
+    green "5. 修改 Reality 端口"
+    green "6. 修改 Reality 伪装域名"
+    green "7. sing-box 服务管理"
+    green "8. 查看 sing-box 日志"
+    red "9. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-7): " choice
+    reading "请输入选择(0-9): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -671,13 +1457,15 @@ while true; do
     case "$choice" in
         1) run_install_flow ;;
         2) show_reality_info ;;
-        3) change_port ;;
-        4) change_reality_domain ;;
-        5) manage_singbox ;;
-        6) show_singbox_logs ;;
-        7) uninstall_singbox ;;
+        3) manage_users_menu ;;
+        4) manage_outbounds_menu ;;
+        5) change_port ;;
+        6) change_reality_domain ;;
+        7) manage_singbox ;;
+        8) show_singbox_logs ;;
+        9) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 7" ;;
+        *) red "无效的选项，请输入 0 到 9" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""

@@ -1,12 +1,18 @@
 # Alpine-sing-box
 
-这是一个精简版 `sing-box` Reality-only 安装/管理脚本，只配置 VLESS Reality 入站。
+这是一个精简版 `sing-box` Reality 安装/管理脚本，只配置一个 VLESS Reality 入站，并支持多个入站用户按用户名绑定到不同 outbound。
 
 ## 功能
 
 - 优先复用本机已安装且可执行的 `sing-box`
 - 本机没有可用 `sing-box` 时先尝试 Alpine 包安装，再补兼容库并下载上游二进制
-- 仅生成 VLESS Reality 配置
+- 仅生成 VLESS Reality 入站配置
+- 支持多个 Reality 入站用户，每个用户独立 UUID/name
+- 支持按用户绑定 outbound：本机直连 `direct`、SOCKS5、Shadowsocks、VLESS
+- 默认创建 `default-direct` 用户并绑定 `direct`，保留当前 VPS 本机直接作为节点的用法
+- 支持手动添加带账号密码的 SOCKS5 落地
+- 支持从 `ss://` 或其 base64 内容导入 Shadowsocks 落地
+- 支持从 `vless://` 或其 base64 内容导入 TCP/TLS/Reality VLESS 落地
 - 支持自定义 Reality 端口和伪装域名/SNI
 - 不安装 nginx
 - 不配置 Argo/Cloudflare Tunnel
@@ -60,10 +66,29 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持查看 Reality 参数、修改端口、修改伪装域名、启动/停止/重启 sing-box、查看日志、卸载。
+菜单支持查看 Reality 参数和所有用户链接、管理入站用户、管理落地 outbound、修改端口、修改伪装域名、启动/停止/重启 sing-box、查看日志、卸载。
+
+## 使用方式
+
+安装完成后会自动生成一个 `default-direct` 用户，绑定内置 `direct` outbound。这个用户连接当前 VPS 后直接从当前 VPS 出口访问网络，保持原来的本机 Reality 节点用法。
+
+如需把当前 VPS 作为中转入口使用，可以在菜单中：
+
+1. 进入“管理落地 outbound”添加 SOCKS5、导入 SS 或导入 VLESS 落地。
+2. 进入“管理入站用户”添加新用户，并选择绑定到指定落地 outbound。
+3. 客户端仍使用脚本生成的 VLESS Reality 链接连接当前 VPS；服务端会按用户 name/UUID 路由到绑定的 outbound。
+
+内置 outbound：
+
+- `direct`：当前 VPS 本机直连出口，不能删除。
+- `block`：未匹配用户兜底阻断，不能删除。
+
+删除落地 outbound 前，脚本会检查是否仍有用户绑定；被使用时会拒绝删除。
 
 ## 说明
 
 - 建议在 `root` 环境下执行
 - 脚本主要面向 Alpine/OpenRC，也兼容常见 systemd 发行版
 - 如不传参数，默认进入交互菜单
+- 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/` 和 `/etc/sing-box/outbounds.d/`
+- 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
