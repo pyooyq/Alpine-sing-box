@@ -34,6 +34,8 @@ block_outbound_tag="block"
 default_user_name="default-direct"
 default_flow="xtls-rprx-vision"
 default_fingerprint="chrome"
+imported_outbound_tag=""
+imported_outbound_file=""
 
 usage() {
     cat << EOF
@@ -292,6 +294,10 @@ validate_new_outbound_tag() {
     return 0
 }
 
+prepare_import_base() {
+    imported_outbound_tag=""
+    imported_outbound_file=""
+}
 load_user_file() {
     local file="$1"
     [ -f "$file" ] || return 1
@@ -367,6 +373,23 @@ save_socks_outbound() {
         write_env_line SERVER_PORT "$server_port"
         write_env_line USERNAME "$username"
         write_env_line PASSWORD "$password"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+save_http_outbound() {
+    local tag="$1" display_name="$2" server="$3" server_port="$4" username="$5" password="$6" tls_enabled="${7:-0}" file
+    tag=$(sanitize_tag "$tag")
+    file=$(outbound_file "$tag")
+    {
+        write_env_line TAG "$tag"
+        write_env_line TYPE "http"
+        write_env_line DISPLAY_NAME "$display_name"
+        write_env_line SERVER "$server"
+        write_env_line SERVER_PORT "$server_port"
+        write_env_line USERNAME "$username"
+        write_env_line PASSWORD "$password"
+        write_env_line TLS_ENABLED "$tls_enabled"
     } > "$file"
     chmod 600 "$file"
 }
@@ -647,7 +670,7 @@ render_outbound_json() {
         server_port="$SERVER_PORT"
         [ -n "$tag" ] && [ -n "$type" ] || continue
         case "$type" in
-            socks)
+            socks|http)
                 [ -n "$server" ] && validate_port "$server_port" || continue
                 ;;
             shadowsocks)
@@ -662,15 +685,18 @@ render_outbound_json() {
         esac
         printf ',\n'
         case "$type" in
-            socks)
+            socks|http)
                 printf '    {\n'
-                printf '      "type": "socks",\n'
+                printf '      "type": %s,\n' "$(json_string "$type")"
                 printf '      "tag": %s,\n' "$(json_string "$tag")"
                 printf '      "server": %s,\n' "$(json_string "$server")"
-                printf '      "server_port": %s,\n' "$server_port"
-                printf '      "version": "5"'
+                printf '      "server_port": %s' "$server_port"
+                [ "$type" = "socks" ] && printf ',\n      "version": "5"'
                 [ -n "$USERNAME" ] && printf ',\n      "username": %s' "$(json_string "$USERNAME")"
                 [ -n "$PASSWORD" ] && printf ',\n      "password": %s' "$(json_string "$PASSWORD")"
+                if [ "$type" = "http" ] && [ "$TLS_ENABLED" = "1" ]; then
+                    printf ',\n      "tls": {\n        "enabled": true\n      }'
+                fi
                 printf '\n    }'
                 ;;
             shadowsocks)
@@ -1248,30 +1274,6 @@ delete_user() {
     green "用户已删除：$name"
 }
 
-manage_users_menu() {
-    local choice
-    require_reality_state || return 1
-    clear
-    green "=== 入站用户管理 ===\n"
-    green "1. 列出用户"
-    green "2. 添加用户并绑定 outbound"
-    green "3. 查看用户链接"
-    green "4. 修改用户绑定 outbound"
-    red "5. 删除用户"
-    purple "0. 返回主菜单"
-    reading "请输入选择: " choice
-
-    case "$choice" in
-        1) list_users ;;
-        2) add_user_with_outbound ;;
-        3) show_one_user_link ;;
-        4) change_user_outbound ;;
-        5) delete_user ;;
-        0) return ;;
-        *) red "无效的选项" ;;
-    esac
-}
-
 add_socks_outbound() {
     local tag display_name server server_port username password
     require_reality_state || return 1
@@ -1295,13 +1297,13 @@ add_socks_outbound() {
 decode_import_input() {
     local input="$1" decoded
     input=$(trim "$input")
-    if [[ "$input" == ss://* || "$input" == vless://* ]]; then
+    if [[ "$input" == ss://* || "$input" == vless://* || "$input" == http://* || "$input" == https://* ]]; then
         printf '%s' "$input"
         return 0
     fi
     decoded=$(b64_decode "$input") || return 1
     decoded=$(trim "$decoded")
-    if [[ "$decoded" == ss://* || "$decoded" == vless://* ]]; then
+    if [[ "$decoded" == ss://* || "$decoded" == vless://* || "$decoded" == http://* || "$decoded" == https://* ]]; then
         printf '%s' "$decoded"
         return 0
     fi
@@ -1326,11 +1328,8 @@ parse_common_uri() {
     fi
 }
 
-import_shadowsocks_outbound() {
-    local input uri body fragment query main userinfo hostport decoded method password server server_port plugin plugin_opts tag display_name
-    require_reality_state || return 1
-    reading "请输入 ss:// 链接或其 base64: " input
-    parse_common_uri "$input" || { red "无法解析 SS 导入内容。"; return 1; }
+import_shadowsocks_uri() {
+    local uri body fragment query main userinfo hostport decoded method password server server_port plugin plugin_opts tag display_name
     uri="$PARSED_URI"
     body="$PARSED_BODY"
     query="$PARSED_QUERY"
@@ -1371,15 +1370,12 @@ import_shadowsocks_outbound() {
     validate_new_outbound_tag "$tag" || return 1
     display_name="${fragment:-$tag}"
     save_shadowsocks_outbound "$tag" "$display_name" "$server" "$server_port" "$method" "$password" "$plugin" "$plugin_opts"
-    apply_config_or_remove "$(outbound_file "$tag")" || return 1
-    green "SS 落地已导入：$tag"
+    imported_outbound_tag="$tag"
+    imported_outbound_file=$(outbound_file "$tag")
 }
 
-import_vless_outbound() {
-    local input uri body fragment query main hostport security tag display_name outbound_uuid server server_port flow network tls_enabled tls_server_name tls_insecure reality_enabled reality_public_key reality_short_id utls_fingerprint
-    require_reality_state || return 1
-    reading "请输入 vless:// 链接或其 base64: " input
-    parse_common_uri "$input" || { red "无法解析 VLESS 导入内容。"; return 1; }
+import_vless_uri() {
+    local uri body fragment query main hostport security tag display_name outbound_uuid server server_port flow network tls_enabled tls_server_name tls_insecure utls_fingerprint
     uri="$PARSED_URI"
     body="$PARSED_BODY"
     query="$PARSED_QUERY"
@@ -1398,24 +1394,18 @@ import_vless_outbound() {
     network=$(get_query_param "$query" "type" || true)
     [ -n "$network" ] || network="tcp"
     security=$(get_query_param "$query" "security" || true)
+    [ -n "$security" ] || security="none"
+    [ "$security" != "reality" ] || { red "不支持导入 VLESS Reality 落地，请使用 non-Reality VLESS/TLS/SS/HTTP/SOCKS5 落地。"; return 1; }
+    [ "$security" = "none" ] || [ "$security" = "tls" ] || { red "当前仅支持 VLESS security=none 或 tls。"; return 1; }
     tls_server_name=$(get_query_param "$query" "sni" || true)
     utls_fingerprint=$(get_query_param "$query" "fp" || true)
     tls_insecure=$(get_query_param "$query" "allowInsecure" || true)
     [ "$tls_insecure" = "1" ] || [ "$tls_insecure" = "true" ] && tls_insecure=1 || tls_insecure=0
-    reality_public_key=$(get_query_param "$query" "pbk" || true)
-    reality_short_id=$(get_query_param "$query" "sid" || true)
     tls_enabled=0
-    reality_enabled=0
-    if [ "$security" = "tls" ] || [ "$security" = "reality" ]; then
-        tls_enabled=1
-    fi
-    if [ "$security" = "reality" ]; then
-        reality_enabled=1
-        [ -n "$reality_public_key" ] || { red "Reality VLESS 链接缺少 pbk。"; return 1; }
-    fi
+    [ "$security" = "tls" ] && tls_enabled=1
 
     if [ "$network" != "tcp" ]; then
-        red "当前首版仅支持导入 VLESS TCP 出站，请改用 TCP 链接或手动配置。"
+        red "当前仅支持导入 VLESS TCP 出站，请改用 TCP 链接或手动配置。"
         return 1
     fi
 
@@ -1424,9 +1414,102 @@ import_vless_outbound() {
     tag=$(sanitize_tag "$tag")
     validate_new_outbound_tag "$tag" || return 1
     display_name="${fragment:-$tag}"
-    save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "$reality_enabled" "$reality_public_key" "$reality_short_id" "$utls_fingerprint"
-    apply_config_or_remove "$(outbound_file "$tag")" || return 1
-    green "VLESS 落地已导入：$tag"
+    save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "0" "" "" "$utls_fingerprint"
+    imported_outbound_tag="$tag"
+    imported_outbound_file=$(outbound_file "$tag")
+}
+
+import_http_uri() {
+    local uri body fragment scheme main auth hostport username password server server_port tag display_name tls_enabled
+    uri="$PARSED_URI"
+    body="$PARSED_BODY"
+    fragment="$PARSED_FRAGMENT"
+    case "$uri" in
+        http://*) scheme="http"; tls_enabled=0 ;;
+        https://*) scheme="https"; tls_enabled=1 ;;
+        *) red "导入内容不是 http:// 或 https://"; return 1 ;;
+    esac
+
+    main="$body"
+    username=""
+    password=""
+    if [[ "$main" == *@* ]]; then
+        auth=${main%@*}
+        hostport=${main#*@}
+        username=$(url_decode "${auth%%:*}")
+        if [[ "$auth" == *:* ]]; then
+            password=$(url_decode "${auth#*:}")
+        fi
+    else
+        hostport="$main"
+    fi
+
+    server=${hostport%:*}
+    server_port=${hostport##*:}
+    [ -n "$server" ] || { red "HTTP 落地缺少服务器地址。"; return 1; }
+    validate_port "$server_port" || { red "HTTP 落地端口无效。"; return 1; }
+
+    reading "请输入落地 tag（留空使用链接名称）: " tag
+    [ -n "$tag" ] || tag="${fragment:-${scheme}-$(date +%s)}"
+    tag=$(sanitize_tag "$tag")
+    validate_new_outbound_tag "$tag" || return 1
+    display_name="${fragment:-$tag}"
+    save_http_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password" "$tls_enabled"
+    imported_outbound_tag="$tag"
+    imported_outbound_file=$(outbound_file "$tag")
+}
+
+import_outbound_from_input() {
+    local input
+    require_reality_state || return 1
+    prepare_import_base
+    reading "请输入落地链接或其 base64（支持 ss/vless/http/https）: " input
+    parse_common_uri "$input" || { red "无法解析导入内容。"; return 1; }
+
+    case "$PARSED_URI" in
+        ss://*) import_shadowsocks_uri ;;
+        vless://*) import_vless_uri ;;
+        http://*|https://*) import_http_uri ;;
+        *) red "不支持的落地协议。"; return 1 ;;
+    esac
+}
+
+import_outbound_auto() {
+    require_reality_state || return 1
+    import_outbound_from_input || return 1
+    apply_config_or_remove "$imported_outbound_file" || return 1
+    green "落地已导入：$imported_outbound_tag"
+}
+
+quick_add_landing_user() {
+    local name uuid user_path outbound_path status
+    require_reality_state || return 1
+    import_outbound_from_input || return 1
+
+    reading "请输入新入站用户名称（留空使用落地 tag）: " name
+    [ -n "$name" ] || name="$imported_outbound_tag"
+    name=$(sanitize_tag "$name")
+    if user_exists "$name"; then
+        rm -f "$imported_outbound_file"
+        red "用户已存在: $name"
+        return 1
+    fi
+
+    uuid=$(generate_uuid)
+    save_user "$name" "$uuid" "$imported_outbound_tag"
+    user_path=$(user_file "$name")
+    outbound_path="$imported_outbound_file"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$user_path" "$outbound_path"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    green "已添加落地并绑定用户：${name} -> ${imported_outbound_tag}"
+    purple "$(user_link "$uuid" "$name" "$default_flow")\n"
 }
 
 outbound_in_use() {
@@ -1455,25 +1538,53 @@ delete_outbound() {
     green "outbound 已删除：$tag"
 }
 
-manage_outbounds_menu() {
+manage_route_menu() {
     local choice
     require_reality_state || return 1
     clear
-    green "=== 落地 outbound 管理 ===\n"
-    green "1. 列出落地"
-    green "2. 添加 SOCKS5 落地"
-    green "3. 导入 SS 落地"
-    green "4. 导入 VLESS 落地"
-    red "5. 删除落地"
+    green "=== 用户和落地管理 ===\n"
+    green "1. 一键添加落地并绑定新用户"
+    green "2. 单独导入落地（自动识别协议）"
+    green "3. 手动添加 SOCKS5 落地"
+    green "4. 单独添加用户并绑定已有 outbound"
+    green "5. 查看用户链接"
+    green "6. 修改用户绑定 outbound"
+    green "7. 列出用户"
+    green "8. 列出落地"
+    red "9. 删除用户"
+    red "10. 删除落地"
     purple "0. 返回主菜单"
     reading "请输入选择: " choice
 
     case "$choice" in
-        1) list_outbounds ;;
-        2) add_socks_outbound ;;
-        3) import_shadowsocks_outbound ;;
-        4) import_vless_outbound ;;
-        5) delete_outbound ;;
+        1) quick_add_landing_user ;;
+        2) import_outbound_auto ;;
+        3) add_socks_outbound ;;
+        4) add_user_with_outbound ;;
+        5) show_one_user_link ;;
+        6) change_user_outbound ;;
+        7) list_users ;;
+        8) list_outbounds ;;
+        9) delete_user ;;
+        10) delete_outbound ;;
+        0) return ;;
+        *) red "无效的选项" ;;
+    esac
+}
+
+manage_reality_settings_menu() {
+    local choice
+    require_reality_state || return 1
+    clear
+    green "=== Reality 设置 ===\n"
+    green "1. 修改 Reality 端口"
+    green "2. 修改 Reality 伪装域名/SNI"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " choice
+
+    case "$choice" in
+        1) change_port ;;
+        2) change_reality_domain ;;
         0) return ;;
         *) red "无效的选项" ;;
     esac
@@ -1538,16 +1649,15 @@ menu() {
     purple "=== sing-box Reality 中转/本机节点脚本 ===\n"
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化 Reality 节点"
-    green "2. 查看 Reality 用户和落地摘要"
-    green "3. 管理入站用户"
-    green "4. 管理落地 outbound"
-    green "5. 修改 Reality 端口"
-    green "6. 修改 Reality 伪装域名"
-    green "7. sing-box 服务管理"
-    green "8. 查看 sing-box 日志"
-    red "9. 卸载 sing-box"
+    green "2. 一键添加落地并绑定新用户"
+    green "3. 查看 Reality 用户和落地摘要"
+    green "4. 管理用户和落地"
+    green "5. 修改 Reality 设置"
+    green "6. sing-box 服务管理"
+    green "7. 查看 sing-box 日志"
+    red "8. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-9): " choice
+    reading "请输入选择(0-8): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -1561,16 +1671,15 @@ while true; do
     menu
     case "$choice" in
         1) run_install_flow ;;
-        2) show_reality_info ;;
-        3) manage_users_menu ;;
-        4) manage_outbounds_menu ;;
-        5) change_port ;;
-        6) change_reality_domain ;;
-        7) manage_singbox ;;
-        8) show_singbox_logs ;;
-        9) uninstall_singbox ;;
+        2) quick_add_landing_user ;;
+        3) show_reality_info ;;
+        4) manage_route_menu ;;
+        5) manage_reality_settings_menu ;;
+        6) manage_singbox ;;
+        7) show_singbox_logs ;;
+        8) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 9" ;;
+        *) red "无效的选项，请输入 0 到 8" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
