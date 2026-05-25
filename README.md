@@ -1,13 +1,14 @@
 # Alpine-sing-box
 
-这是一个精简版 `sing-box` Reality 安装/管理脚本，只配置一个 VLESS Reality 入站，并支持多个入站用户按用户名绑定到不同 outbound。
+这是一个精简版 `sing-box` 安装/管理脚本，支持 VLESS Reality、普通 VLESS、Shadowsocks 入站，并支持多个入站按用户名绑定到不同 outbound。
 
 ## 功能
 
 - 优先复用本机已安装且可执行的 `sing-box`
 - 本机没有可用 `sing-box` 时先尝试 Alpine 包安装，再补兼容库并下载上游二进制
-- 仅生成 VLESS Reality 入站配置
-- 支持多个 Reality 入站用户，每个用户独立 UUID/name
+- 生成精简 sing-box 入站配置，支持 VLESS Reality、普通 VLESS、Shadowsocks
+- 支持多个入站用户，每个用户独立 UUID/name 或 SS 密码
+- 添加入站时可选择 VLESS、VLESS + Reality、Shadowsocks
 - 支持按用户绑定 outbound：本机直连 `direct`、SOCKS5、Shadowsocks、VLESS、HTTP
 - 默认创建 `default-direct` 用户并绑定 `direct`，保留当前 VPS 本机直接作为节点的用法
 - 支持一键添加落地并自动创建绑定用户
@@ -67,7 +68,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持一键添加落地并绑定用户、自动识别协议导入落地、查看 Reality 摘要、合并管理用户和落地、修改 Reality 设置、启动/停止/重启 sing-box、查看日志、卸载。
+菜单支持一键添加落地并绑定入站、添加 VLESS/VLESS+Reality/Shadowsocks 入站、自动识别协议导入落地、查看节点摘要、合并管理用户和落地、修改 Reality 设置、启动/停止/重启 sing-box、查看日志、卸载。
 
 ## 使用方式
 
@@ -75,9 +76,10 @@ sb
 
 如需把当前 VPS 作为中转入口使用，可以在菜单中：
 
-1. 使用“一键添加落地并绑定新用户”，直接粘贴 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容，脚本会自动识别协议并创建对应落地与用户。
-2. 进入“管理用户和落地”处理已有用户、查看链接、修改绑定、列出/删除落地，或单独导入落地。
-3. 客户端仍使用脚本生成的 VLESS Reality 链接连接当前 VPS；服务端会按用户 name/UUID 路由到绑定的 outbound。
+1. 使用“一键添加落地并绑定新入站”，直接粘贴 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容，脚本会自动识别协议并创建对应落地与入站。
+2. 添加入站时选择 `VLESS + Reality`、`VLESS` 或 `Shadowsocks`；Reality 入站使用主 Reality 端口，普通 VLESS/SS 会提示设置独立入站端口。
+3. 进入“管理用户和落地”处理已有用户、查看链接、修改绑定、列出/删除落地，或单独导入落地。
+4. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户路由到绑定的 outbound。
 
 内置 outbound：
 
@@ -93,3 +95,4 @@ sb
 - 如不传参数，默认进入交互菜单
 - 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/` 和 `/etc/sing-box/outbounds.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
+- `-port` 指定的是 Reality 主入站端口；普通 VLESS/SS 入站在菜单中单独设置端口
