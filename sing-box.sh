@@ -1351,7 +1351,7 @@ change_reality_domain() {
     local new_domain old_domain status
     old_domain="$REALITY_DOMAIN"
     reading "请输入新的 Reality 伪装域名/SNI: " new_domain
-    validate_domain "$new_domain" || { red "域名不能为空，且不能包含空格或引号。"; return 1; }
+    validate_domain "$new_domain" || { red "域名需为包含点的 FQDN，且只能包含字母、数字、点或连字符。"; return 1; }
 
     REALITY_DOMAIN="$new_domain"
     if [ "$REALITY_DOMAIN" = "$old_domain" ]; then
