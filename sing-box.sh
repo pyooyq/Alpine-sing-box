@@ -17,6 +17,7 @@ yellow() { echo -e "${yellow}$1${re}"; }
 purple() { echo -e "${purple}$1${re}"; }
 skyblue() { echo -e "${skyblue}$1${re}"; }
 reading() { read -r -p "$(red "$1")" "$2"; }
+clear_screen() { command -v clear >/dev/null 2>&1 && clear || printf '\033c'; }
 
 server_name="sing-box"
 work_dir="/etc/sing-box"
@@ -68,7 +69,10 @@ validate_port() {
 }
 
 validate_domain() {
-    [ -n "$1" ] && [[ "$1" != *\ * ]] && [[ "$1" != *\"* ]] && [[ "$1" != *\'* ]]
+    [ -n "$1" ] || return 1
+    [[ "$1" == *.* ]] || return 1
+    [[ "$1" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+    return 0
 }
 
 random_port() {
@@ -78,7 +82,7 @@ random_port() {
     fi
 
     local n
-    n=$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')
+    n=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
     echo $((20000 + n % 45001))
 }
 
@@ -244,7 +248,6 @@ load_state() {
     PRIVATE_KEY=$(read_env_value "$state_file" PRIVATE_KEY || true)
     PUBLIC_KEY=$(read_env_value "$state_file" PUBLIC_KEY || true)
     SHORT_ID=$(read_env_value "$state_file" SHORT_ID || true)
-    UUID=$(read_env_value "$state_file" UUID || true)
 }
 
 save_state() {
@@ -322,6 +325,7 @@ load_user_file() {
         "$users_dir"/*.env) ;;
         *) return 1 ;;
     esac
+    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD
     NAME=$(read_env_value "$file" NAME || true)
     UUID=$(read_env_value "$file" UUID || true)
     FLOW=$(read_env_value "$file" FLOW || true)
@@ -348,6 +352,10 @@ load_outbound_file() {
         "$outbounds_dir"/*.env) ;;
         *) return 1 ;;
     esac
+    unset TAG TYPE DISPLAY_NAME SERVER SERVER_PORT USERNAME PASSWORD METHOD \
+          PLUGIN PLUGIN_OPTS OUT_UUID UUID FLOW NETWORK \
+          TLS_ENABLED TLS_SERVER_NAME TLS_INSECURE \
+          REALITY_ENABLED REALITY_PUBLIC_KEY REALITY_SHORT_ID UTLS_FINGERPRINT
     TAG=$(read_env_value "$file" TAG || true)
     TYPE=$(read_env_value "$file" TYPE || true)
     DISPLAY_NAME=$(read_env_value "$file" DISPLAY_NAME || true)
@@ -445,7 +453,10 @@ save_shadowsocks_outbound() {
 }
 
 save_vless_outbound() {
-    local tag="$1" display_name="$2" server="$3" server_port="$4" uuid="$5" flow="$6" network="$7" tls_enabled="$8" tls_server_name="$9" tls_insecure="${10}" reality_enabled="${11}" reality_public_key="${12}" reality_short_id="${13}" utls_fingerprint="${14}" file
+    local tag="$1" display_name="$2" server="$3" server_port="$4" uuid="$5"
+    local flow="${6:-}" network="${7:-tcp}" tls_enabled="${8:-0}"
+    local tls_server_name="${9:-}" tls_insecure="${10:-0}" utls_fingerprint="${11:-}"
+    local file
     tag=$(sanitize_tag "$tag")
     file=$(outbound_file "$tag")
     {
@@ -456,13 +467,11 @@ save_vless_outbound() {
         write_env_line SERVER_PORT "$server_port"
         write_env_line UUID "$uuid"
         write_env_line FLOW "$flow"
-        write_env_line NETWORK "${network:-tcp}"
-        write_env_line TLS_ENABLED "${tls_enabled:-0}"
+        write_env_line NETWORK "$network"
+        write_env_line TLS_ENABLED "$tls_enabled"
         write_env_line TLS_SERVER_NAME "$tls_server_name"
-        write_env_line TLS_INSECURE "${tls_insecure:-0}"
-        write_env_line REALITY_ENABLED "${reality_enabled:-0}"
-        write_env_line REALITY_PUBLIC_KEY "$reality_public_key"
-        write_env_line REALITY_SHORT_ID "$reality_short_id"
+        write_env_line TLS_INSECURE "$tls_insecure"
+        write_env_line REALITY_ENABLED "0"
         write_env_line UTLS_FINGERPRINT "$utls_fingerprint"
     } > "$file"
     chmod 600 "$file"
@@ -476,7 +485,8 @@ migrate_legacy_state() {
 
     ensure_state_layout
     if ! has_users; then
-        local legacy_uuid="${UUID:-}"
+        local legacy_uuid
+        legacy_uuid=$(read_env_value "$state_file" UUID || true)
         [ -n "$legacy_uuid" ] || legacy_uuid=$(generate_uuid)
         save_user "$default_user_name" "$legacy_uuid" "$direct_outbound_tag" "$default_flow" "$default_inbound_type" "" "$default_ss_method" "$PORT"
     fi
@@ -492,7 +502,10 @@ require_reality_state() {
 validate_config_file() {
     local file="$1" check_output
 
-    is_working_singbox "${work_dir}/${server_name}" || return 0
+    if ! is_working_singbox "${work_dir}/${server_name}"; then
+        [ -f "$config_dir" ] && yellow "sing-box 二进制不可用，跳过配置预校验。"
+        return 0
+    fi
     check_output=$("${work_dir}/${server_name}" check -c "$file" 2>&1) && return 0
 
     if printf '%s' "$check_output" | grep -qiE 'unknown command|unknown flag|flag provided but not defined|No help topic'; then
@@ -569,8 +582,9 @@ use_existing_singbox() {
         mkdir -p "$work_dir"
         chmod 755 "$work_dir"
         if [ "$candidate" != "${work_dir}/${server_name}" ]; then
-            cp "$candidate" "${work_dir}/${server_name}"
+            cp "$candidate" "${work_dir}/${server_name}" || { yellow "复制 sing-box 失败: $candidate"; continue; }
             chmod +x "${work_dir}/${server_name}"
+            is_working_singbox "${work_dir}/${server_name}" || { yellow "复制后的 sing-box 不可执行，继续尝试下一个候选..."; continue; }
         fi
         green "使用本机已安装的 sing-box: $candidate"
         return 0
@@ -1071,6 +1085,22 @@ install_service() {
     fi
 }
 
+install_logrotate() {
+    [ -d /etc/logrotate.d ] || return 0
+    cat > /etc/logrotate.d/sing-box << EOF
+${work_dir}/sing-box.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    chmod 644 /etc/logrotate.d/sing-box
+}
+
 restart_singbox() {
     if command_exists systemctl && [ -f /etc/systemd/system/sing-box.service ]; then
         systemctl daemon-reload
@@ -1132,7 +1162,7 @@ user_link() {
             link="vless://${uuid}@${server_ip}:${inbound_port}?encryption=none&security=none&type=tcp&headerType=none#${name}"
             ;;
         shadowsocks)
-            userinfo=$(printf '%s:%s' "$method" "$password" | base64 | tr -d '\n')
+            userinfo=$(printf '%s:%s' "$method" "$password" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
             link="ss://${userinfo}@${server_ip}:${inbound_port}#${name}"
             ;;
         *)
@@ -1195,7 +1225,7 @@ show_reality_info() {
 show_singbox_logs() {
     local log_file="${work_dir}/sing-box.log"
 
-    clear
+    clear_screen
     green "=== sing-box 日志 ===\n"
 
     if [ -s "$log_file" ]; then
@@ -1248,12 +1278,13 @@ run_install_flow() {
         yellow "sing-box 已安装。"
         migrate_legacy_state
         write_config || return 1
+        install_logrotate
         show_reality_info
         create_shortcut
         return 0
     fi
 
-    clear
+    clear_screen
     purple "正在安装 sing-box 多协议入站中转/本机节点..."
     ensure_dependencies
     install_singbox_binary
@@ -1273,6 +1304,7 @@ run_install_flow() {
     write_config || exit 1
     allow_port "$SELECTED_INBOUND_PORT"
     install_service
+    install_logrotate
     create_shortcut
     show_reality_info
 }
@@ -1629,7 +1661,10 @@ import_vless_uri() {
     tls_server_name=$(get_query_param "$query" "sni" || true)
     utls_fingerprint=$(get_query_param "$query" "fp" || true)
     tls_insecure=$(get_query_param "$query" "allowInsecure" || true)
-    [ "$tls_insecure" = "1" ] || [ "$tls_insecure" = "true" ] && tls_insecure=1 || tls_insecure=0
+    case "$tls_insecure" in
+        1|true) tls_insecure=1 ;;
+        *) tls_insecure=0 ;;
+    esac
     tls_enabled=0
     [ "$security" = "tls" ] && tls_enabled=1
 
@@ -1643,7 +1678,7 @@ import_vless_uri() {
     tag=$(sanitize_tag "$tag")
     validate_new_outbound_tag "$tag" || return 1
     display_name="${fragment:-$tag}"
-    save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "0" "" "" "$utls_fingerprint"
+    save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "$utls_fingerprint"
     imported_outbound_tag="$tag"
     imported_outbound_file=$(outbound_file "$tag")
 }
@@ -1772,7 +1807,7 @@ delete_outbound() {
 manage_route_menu() {
     local choice
     require_reality_state || return 1
-    clear
+    clear_screen
     green "=== 用户和落地管理 ===\n"
     green "1. 一键添加落地并绑定新入站"
     green "2. 单独导入落地（自动识别协议）"
@@ -1806,7 +1841,7 @@ manage_route_menu() {
 manage_reality_settings_menu() {
     local choice
     require_reality_state || return 1
-    clear
+    clear_screen
     green "=== Reality 设置 ===\n"
     green "1. 修改 Reality 端口"
     green "2. 修改 Reality 伪装域名/SNI"
@@ -1825,7 +1860,7 @@ manage_singbox() {
     local singbox_status choice
     singbox_status=$(check_singbox 2>/dev/null)
 
-    clear
+    clear_screen
     green "=== sing-box 服务管理 ===\n"
     green "当前状态: ${singbox_status}\n"
     green "1. 启动 sing-box"
@@ -1864,6 +1899,7 @@ uninstall_singbox() {
             fi
             rm -rf "$work_dir"
             rm -f /usr/bin/sb
+            rm -f /etc/logrotate.d/sing-box
             green "sing-box 已卸载。"
             ;;
         *)
@@ -1876,7 +1912,7 @@ menu() {
     local singbox_status
     singbox_status=$(check_singbox 2>/dev/null)
 
-    clear
+    clear_screen
     purple "=== sing-box 多协议入站中转/本机节点脚本 ===\n"
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
