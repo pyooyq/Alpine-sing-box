@@ -1433,106 +1433,31 @@ save_selected_user() {
     save_user "$1" "$2" "$3" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT"
 }
 
-select_outbound_tag() {
-    require_reality_state || return 1
-
-    local options=("$direct_outbound_tag") labels=("${direct_outbound_tag} | 本机直连") file index choice
-    for file in "$outbounds_dir"/*.env; do
-        [ -f "$file" ] || continue
-        load_outbound_file "$file" || continue
-        [ -n "$TAG" ] || continue
-        options+=("$TAG")
-        labels+=("${TAG} | ${TYPE} | ${DISPLAY_NAME:-$TAG}")
-    done
-
-    green "\n请选择 outbound："
-    for index in "${!labels[@]}"; do
-        purple "$((index + 1)). ${labels[$index]}"
-    done
-    reading "请输入编号: " choice
-    [[ "$choice" =~ ^[0-9]+$ ]] || return 1
-    [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ] || return 1
-    SELECTED_OUTBOUND_TAG="${options[$((choice - 1))]}"
-}
-
-add_user_with_outbound() {
-    local name uuid outbound_tag
-    require_reality_state || return 1
-    reading "请输入用户名称（英文/数字，留空自动生成）: " name
-    [ -n "$name" ] || name="user-$(date +%s)"
-    name=$(sanitize_tag "$name")
-    user_exists "$name" && { red "用户已存在: $name"; return 1; }
-
-    select_inbound_profile || return 1
-
-    if ! select_outbound_tag; then
-        red "未选择有效 outbound。"
-        return 1
+create_bound_user_for_outbound() {
+    local outbound_tag="$1" name uuid user_path outbound_path status
+    name=$(sanitize_tag "$outbound_tag")
+    if user_exists "$name"; then
+        name="${name}-$(date +%s)"
     fi
 
-    outbound_tag="$SELECTED_OUTBOUND_TAG"
+    use_default_inbound_profile
     uuid=$(generate_uuid)
     save_selected_user "$name" "$uuid" "$outbound_tag"
-    apply_config_or_remove "$(user_file "$name")" || return 1
-    allow_port "$SELECTED_INBOUND_PORT"
-    green "用户已添加：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT")\n"
-}
+    user_path=$(user_file "$name")
+    outbound_path=$(outbound_file "$outbound_tag")
 
-change_user_outbound() {
-    local name file
-    require_reality_state || return 1
-    list_users
-    reading "请输入要修改的用户名称: " name
-    name=$(sanitize_tag "$name")
-    file=$(user_file "$name")
-    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
-
-    if ! select_outbound_tag; then
-        red "未选择有效 outbound。"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$user_path" "$outbound_path"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
 
-    load_user_file "$file"
-    if [ "$OUTBOUND_TAG" = "$SELECTED_OUTBOUND_TAG" ]; then
-        yellow "用户 ${NAME} 的 outbound 未变化。"
-        return 0
-    fi
-    cp "$file" "${file}.bak"
-    save_user "$NAME" "$UUID" "$SELECTED_OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT"
-    apply_config_or_restore "$file" "${file}.bak" || return 1
-    green "用户 ${NAME} 已绑定到 ${SELECTED_OUTBOUND_TAG}"
-}
-
-show_one_user_link() {
-    local name file
-    require_reality_state || return 1
-    list_users
-    reading "请输入用户名称: " name
-    name=$(sanitize_tag "$name")
-    file=$(user_file "$name")
-    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
-    load_user_file "$file"
-    purple "$(user_link "$UUID" "$NAME" "$FLOW" "" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT")\n"
-}
-
-delete_user() {
-    local name file count=0 item
-    require_reality_state || return 1
-    list_users
-    reading "请输入要删除的用户名称: " name
-    name=$(sanitize_tag "$name")
-    file=$(user_file "$name")
-    [ -f "$file" ] || { red "用户不存在: $name"; return 1; }
-
-    for item in "$users_dir"/*.env; do
-        [ -f "$item" ] && count=$((count + 1))
-    done
-    [ "$count" -gt 1 ] || { red "至少保留一个入站用户。"; return 1; }
-
-    mv "$file" "${file}.bak"
-    apply_config_or_restore "$file" "${file}.bak" || return 1
-    green "用户已删除：$name"
+    allow_port "$SELECTED_INBOUND_PORT"
+    green "已添加落地并自动绑定用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
+    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT")\n"
 }
 
 add_socks_outbound() {
@@ -1551,8 +1476,7 @@ add_socks_outbound() {
     reading "请输入 SOCKS5 密码: " password
 
     save_socks_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password"
-    apply_config_or_remove "$(outbound_file "$tag")" || return 1
-    green "SOCKS5 落地已添加：$tag"
+    create_bound_user_for_outbound "$tag" || return 1
 }
 
 decode_import_input() {
@@ -1741,55 +1665,23 @@ import_outbound_from_input() {
 import_outbound_auto() {
     require_reality_state || return 1
     import_outbound_from_input || return 1
-    apply_config_or_remove "$imported_outbound_file" || return 1
-    green "落地已导入：$imported_outbound_tag"
+    create_bound_user_for_outbound "$imported_outbound_tag" || return 1
 }
 
-quick_add_landing_user() {
-    local name uuid user_path outbound_path status
-    require_reality_state || return 1
-    import_outbound_from_input || return 1
-
-    reading "请输入新入站用户名称（留空使用落地 tag）: " name
-    [ -n "$name" ] || name="$imported_outbound_tag"
-    name=$(sanitize_tag "$name")
-    if user_exists "$name"; then
-        rm -f "$imported_outbound_file"
-        red "用户已存在: $name"
-        return 1
-    fi
-
-    select_inbound_profile || { rm -f "$imported_outbound_file"; return 1; }
-    uuid=$(generate_uuid)
-    save_selected_user "$name" "$uuid" "$imported_outbound_tag"
-    user_path=$(user_file "$name")
-    outbound_path="$imported_outbound_file"
-    apply_config
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        rm -f "$user_path" "$outbound_path"
-        write_config >/dev/null 2>&1 || true
-        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
-        return 1
-    fi
-
-    allow_port "$SELECTED_INBOUND_PORT"
-    green "已添加落地并绑定用户：${name} -> ${imported_outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT")\n"
-}
-
-outbound_in_use() {
-    local tag="$1" file
+users_for_outbound() {
+    local tag="$1" file first=1
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
-        [ "$OUTBOUND_TAG" = "$tag" ] && { printf '%s' "$NAME"; return 0; }
+        [ "$OUTBOUND_TAG" = "$tag" ] || continue
+        [ "$first" -eq 1 ] || printf ' '
+        first=0
+        printf '%s' "$NAME"
     done
-    return 1
 }
 
 delete_outbound() {
-    local tag user file
+    local tag file user users backup_dir status item count=0
     require_reality_state || return 1
     list_outbounds
     reading "请输入要删除的落地 tag: " tag
@@ -1797,42 +1689,66 @@ delete_outbound() {
     [ "$tag" != "$direct_outbound_tag" ] && [ "$tag" != "$block_outbound_tag" ] || { red "不能删除内置 outbound: $tag"; return 1; }
     file=$(outbound_file "$tag")
     [ -f "$file" ] || { red "outbound 不存在: $tag"; return 1; }
-    user=$(outbound_in_use "$tag" || true)
-    [ -z "$user" ] || { red "outbound 正被用户 ${user} 使用，不能删除。"; return 1; }
-    mv "$file" "${file}.bak"
-    apply_config_or_restore "$file" "${file}.bak" || return 1
-    green "outbound 已删除：$tag"
+    users=$(users_for_outbound "$tag")
+
+    for item in "$users_dir"/*.env; do
+        [ -f "$item" ] && count=$((count + 1))
+    done
+    for user in $users; do
+        count=$((count - 1))
+    done
+    [ "$count" -gt 0 ] || { red "至少保留一个入站用户，不能删除最后一组落地和用户。"; return 1; }
+
+    backup_dir="${work_dir}/delete-${tag}-$(date +%s).bak"
+    mkdir -p "$backup_dir"
+    mv "$file" "$backup_dir/outbound.env"
+    for user in $users; do
+        mv "$(user_file "$user")" "$backup_dir/user-${user}.env"
+    done
+
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        mv "$backup_dir/outbound.env" "$file" 2>/dev/null || true
+        for item in "$backup_dir"/user-*.env; do
+            [ -f "$item" ] || continue
+            user=${item##*/user-}
+            user=${user%.env}
+            mv "$item" "$(user_file "$user")"
+        done
+        rmdir "$backup_dir" 2>/dev/null || true
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    rm -rf "$backup_dir"
+    if [ -n "$users" ]; then
+        green "outbound 已删除，并同步删除绑定用户：$tag -> $users"
+    else
+        green "outbound 已删除：$tag"
+    fi
 }
 
 manage_route_menu() {
     local choice
     require_reality_state || return 1
     clear_screen
-    green "=== 用户和落地管理 ===\n"
-    green "1. 一键添加落地并绑定新入站"
-    green "2. 单独导入落地（自动识别协议）"
-    green "3. 手动添加 SOCKS5 落地"
-    green "4. 添加入站并绑定已有 outbound"
-    green "5. 查看用户链接"
-    green "6. 修改用户绑定 outbound"
-    green "7. 列出用户"
-    green "8. 列出落地"
-    red "9. 删除用户"
-    red "10. 删除落地"
+    green "=== 落地管理 ===\n"
+    green "1. 导入落地并自动绑定用户"
+    green "2. 手动添加 SOCKS5 落地并自动绑定用户"
+    green "3. 查看节点链接"
+    green "4. 列出落地"
+    red "5. 删除落地和绑定用户"
     purple "0. 返回主菜单"
     reading "请输入选择: " choice
 
     case "$choice" in
-        1) quick_add_landing_user ;;
-        2) import_outbound_auto ;;
-        3) add_socks_outbound ;;
-        4) add_user_with_outbound ;;
-        5) show_one_user_link ;;
-        6) change_user_outbound ;;
-        7) list_users ;;
-        8) list_outbounds ;;
-        9) delete_user ;;
-        10) delete_outbound ;;
+        1) import_outbound_auto ;;
+        2) add_socks_outbound ;;
+        3) show_reality_info ;;
+        4) list_outbounds ;;
+        5) delete_outbound ;;
         0) return ;;
         *) red "无效的选项" ;;
     esac
@@ -1916,9 +1832,9 @@ menu() {
     purple "=== sing-box 多协议入站中转/本机节点脚本 ===\n"
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
-    green "2. 一键添加落地并绑定新入站"
-    green "3. 查看节点用户和落地摘要"
-    green "4. 管理用户和落地"
+    green "2. 添加落地并自动绑定用户"
+    green "3. 查看节点和落地摘要"
+    green "4. 管理落地"
     green "5. 修改 Reality 设置"
     green "6. sing-box 服务管理"
     green "7. 查看 sing-box 日志"
@@ -1938,7 +1854,7 @@ while true; do
     menu
     case "$choice" in
         1) run_install_flow ;;
-        2) quick_add_landing_user ;;
+        2) import_outbound_auto ;;
         3) show_reality_info ;;
         4) manage_route_menu ;;
         5) manage_reality_settings_menu ;;

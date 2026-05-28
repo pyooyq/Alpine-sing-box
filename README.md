@@ -6,14 +6,14 @@
 
 - 优先复用本机已安装且可执行的 `sing-box`
 - 本机没有可用 `sing-box` 时先尝试 Alpine 包安装，再补兼容库并下载上游二进制
-- 生成精简 sing-box 入站配置，支持 VLESS Reality、普通 VLESS、Shadowsocks
+- 生成精简 sing-box 入站配置，默认使用 VLESS Reality 作为中转入口
 - 支持多个入站用户，每个用户独立 UUID/name 或 SS 密码
-- 添加入站时可选择 VLESS、VLESS + Reality、Shadowsocks
+- 添加落地时自动创建独立 VLESS Reality 用户
 - 支持按用户绑定 outbound：本机直连 `direct`、SOCKS5、Shadowsocks、VLESS、HTTP
 - 默认创建 `default-direct` 用户并绑定 `direct`，保留当前 VPS 本机直接作为节点的用法
-- 支持一键添加落地并自动创建绑定用户
-- 支持手动添加带账号密码的 SOCKS5 落地
-- 支持从 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容自动导入落地
+- 支持添加落地时自动创建并绑定用户
+- 支持手动添加带账号密码的 SOCKS5 落地并自动绑定用户
+- 支持从 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容自动导入落地并绑定用户
 - 支持自定义 Reality 端口和伪装域名/SNI
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
@@ -68,7 +68,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持一键添加落地并绑定入站、添加 VLESS/VLESS+Reality/Shadowsocks 入站、自动识别协议导入落地、查看节点摘要、合并管理用户和落地、修改 Reality 设置、启动/停止/重启 sing-box、查看日志、卸载。
+菜单支持添加落地并自动绑定用户、查看节点摘要、管理落地、修改 Reality 设置、启动/停止/重启 sing-box、查看日志、卸载。
 
 ## 使用方式
 
@@ -76,17 +76,16 @@ sb
 
 如需把当前 VPS 作为中转入口使用，可以在菜单中：
 
-1. 使用“一键添加落地并绑定新入站”，直接粘贴 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容，脚本会自动识别协议并创建对应落地与入站。
-2. 添加入站时选择 `VLESS + Reality`、`VLESS` 或 `Shadowsocks`；Reality 入站使用主 Reality 端口，普通 VLESS/SS 会提示设置独立入站端口。
-3. 进入“管理用户和落地”处理已有用户、查看链接、修改绑定、列出/删除落地，或单独导入落地。
-4. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户路由到绑定的 outbound。
+1. 使用“添加落地并自动绑定用户”，直接粘贴 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容，脚本会自动识别协议并创建对应落地与默认 Reality 入站用户。
+2. 进入“管理落地”可导入落地、手动添加 SOCKS5、查看节点链接、列出落地或删除落地。
+3. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户路由到绑定的 outbound。
 
 内置 outbound：
 
 - `direct`：当前 VPS 本机直连出口，不能删除。
 - `block`：未匹配用户兜底阻断，不能删除。
 
-删除落地 outbound 前，脚本会检查是否仍有用户绑定；被使用时会拒绝删除。
+删除落地 outbound 时，脚本会同步删除所有绑定到该落地的用户。
 
 ## 说明
 
@@ -95,4 +94,4 @@ sb
 - 如不传参数，默认进入交互菜单
 - 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/` 和 `/etc/sing-box/outbounds.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
-- `-port` 指定的是 Reality 主入站端口；普通 VLESS/SS 入站在菜单中单独设置端口
+- `-port` 指定的是 Reality 主入站端口；添加落地时会自动创建使用该端口的 Reality 用户
