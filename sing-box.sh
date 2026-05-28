@@ -1260,12 +1260,37 @@ create_shortcut() {
 
     cat > "$installed_script" << 'EOF'
 #!/usr/bin/env bash
-exec bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh) "$@"
+url="https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh"
+tmp=$(mktemp) || { echo "创建临时文件失败" >&2; exit 1; }
+trap 'rm -f "$tmp"' EXIT
+
+if ! curl -fsSL "$url" -o "$tmp"; then
+    echo "拉取 sing-box.sh 失败，请检查网络或稍后重试。" >&2
+    exit 1
+fi
+
+if [ ! -s "$tmp" ]; then
+    echo "拉取到的 sing-box.sh 为空，请稍后重试。" >&2
+    exit 1
+fi
+
+bash "$tmp" "$@"
 EOF
 
     chmod +x "$installed_script"
     cat > /usr/bin/sb << EOF
 #!/usr/bin/env bash
+if [ "\${EUID:-\$(id -u)}" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+        exec sudo bash "${installed_script}" "\$@"
+    fi
+    if command -v doas >/dev/null 2>&1; then
+        exec doas bash "${installed_script}" "\$@"
+    fi
+    echo "请在 root 用户下运行 sb（例如：sudo sb）。" >&2
+    exit 1
+fi
+export SB_SHORTCUT_INSTALLING=1
 exec bash "${installed_script}" "\$@"
 EOF
     chmod +x /usr/bin/sb
@@ -1824,6 +1849,13 @@ uninstall_singbox() {
     esac
 }
 
+ensure_shortcut() {
+    [ "${SB_SHORTCUT_INSTALLING:-0}" = "1" ] && return 0
+    [ "${EUID:-$(id -u)}" -eq 0 ] || return 0
+    [ -f "$installed_script" ] && [ -x /usr/bin/sb ] && return 0
+    create_shortcut
+}
+
 menu() {
     local singbox_status
     singbox_status=$(check_singbox 2>/dev/null)
@@ -1849,6 +1881,8 @@ if [ "$auto_install" -eq 1 ]; then
     run_install_flow
     exit 0
 fi
+
+ensure_shortcut
 
 while true; do
     menu
