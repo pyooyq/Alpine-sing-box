@@ -15,6 +15,7 @@
 - 支持手动添加带账号密码的 SOCKS5 落地并自动绑定用户
 - 支持从 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容自动导入落地并绑定用户
 - 支持自定义 Reality 端口和伪装域名/SNI
+- 支持 TCP/UDP 纯转发：通过 iptables DNAT 内核级转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
 - 不配置 Argo/Cloudflare Tunnel
@@ -68,7 +69,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持添加落地并自动绑定用户、查看节点摘要、管理落地、修改 Reality 设置、启动/停止/重启 sing-box、查看日志、卸载。
+菜单支持添加落地并自动绑定用户、查看节点摘要、管理落地、修改 Reality 设置、TCP/UDP 转发管理、启动/停止/重启 sing-box、查看日志、卸载。
 
 ## 使用方式
 
@@ -87,11 +88,33 @@ sb
 
 删除落地 outbound 时，脚本会同步删除所有绑定到该落地的用户。
 
+## TCP/UDP 转发
+
+如需把当前 VPS 作为纯 TCP/UDP 转发器（不处理协议、不解析流量），可在主菜单选择 **6. TCP/UDP 转发管理** 添加转发规则：
+
+1. 输入规则名称，选择协议（`tcp` / `udp` / `both`）。
+2. 输入本地监听端口和目标地址:端口。
+3. 脚本自动写入 iptables DNAT 规则并生成独立的 OpenRC 服务（开机自启）。
+
+```
+本地 :10086  ->  目标 1.2.3.4:443  (tcp udp)
+```
+
+特点：
+
+- 内核级转发，零用户态开销，客户端无需任何代理配置。
+- 每条规则对应一个独立 OpenRC 服务 `/etc/init.d/sing-box-forward-<tag>`，支持 `start` / `stop` / `status`。
+- TCP 与 UDP 可分别或同时转发。
+- 删除规则会同时移除对应 iptables 规则和服务。
+- 卸载时会自动清理所有转发规则。
+
+> 注意：转发依赖 iptables 内核模块，适用于 Alpine/OpenRC 及大部分 Linux 发行版。
+
 ## 说明
 
 - 建议在 `root` 环境下执行
 - 脚本主要面向 Alpine/OpenRC，也兼容常见 systemd 发行版
 - 如不传参数，默认进入交互菜单
-- 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/` 和 `/etc/sing-box/outbounds.d/`
+- 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/`、`/etc/sing-box/outbounds.d/` 和 `/etc/sing-box/forwards.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
 - `-port` 指定的是 Reality 主入站端口；添加落地时会自动创建使用该端口的 Reality 用户
