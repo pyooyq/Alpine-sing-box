@@ -25,6 +25,7 @@ config_dir="${work_dir}/config.json"
 state_file="${work_dir}/reality.env"
 users_dir="${work_dir}/users.d"
 outbounds_dir="${work_dir}/outbounds.d"
+forwards_dir="${work_dir}/forwards.d"
 installed_script="${work_dir}/sb.sh"
 reality_domain="cas-bridge.xethub.hf.co"
 vless_port=""
@@ -263,9 +264,9 @@ save_state() {
 }
 
 ensure_state_layout() {
-    mkdir -p "$work_dir" "$users_dir" "$outbounds_dir"
+    mkdir -p "$work_dir" "$users_dir" "$outbounds_dir" "$forwards_dir"
     chmod 755 "$work_dir"
-    chmod 700 "$users_dir" "$outbounds_dir"
+    chmod 700 "$users_dir" "$outbounds_dir" "$forwards_dir"
 }
 
 user_file() {
@@ -274,6 +275,18 @@ user_file() {
 
 outbound_file() {
     printf '%s/%s.env' "$outbounds_dir" "$(sanitize_tag "$1")"
+}
+
+forward_file() {
+    printf '%s/%s.env' "$forwards_dir" "$(sanitize_tag "$1")"
+}
+
+forward_service_name() {
+    printf 'sing-box-forward-%s' "$(sanitize_tag "$1")"
+}
+
+forward_file() {
+    printf '%s/%s.env' "$forwards_dir" "$(sanitize_tag "$1")"
 }
 
 has_users() {
@@ -1755,6 +1768,241 @@ delete_outbound() {
     fi
 }
 
+# ── TCP/UDP 转发（iptables DNAT） ──────────────────────────────────
+
+load_forward_file() {
+    local file="$1"
+    [ -f "$file" ] || return 1
+    case "$file" in
+        "$forwards_dir"/*.env) ;;
+        *) return 1 ;;
+    esac
+    unset TAG PROTOCOL LOCAL_PORT TARGET_ADDR TARGET_PORT
+    TAG=$(read_env_value "$file" TAG || true)
+    PROTOCOL=$(read_env_value "$file" PROTOCOL || true)
+    LOCAL_PORT=$(read_env_value "$file" LOCAL_PORT || true)
+    TARGET_ADDR=$(read_env_value "$file" TARGET_ADDR || true)
+    TARGET_PORT=$(read_env_value "$file" TARGET_PORT || true)
+}
+
+save_forward() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" file
+    tag=$(sanitize_tag "$tag")
+    file=$(forward_file "$tag")
+    {
+        write_env_line TAG "$tag"
+        write_env_line PROTOCOL "$protocol"
+        write_env_line LOCAL_PORT "$local_port"
+        write_env_line TARGET_ADDR "$target_addr"
+        write_env_line TARGET_PORT "$target_port"
+    } > "$file"
+    chmod 600 "$file"
+}
+
+forward_exists() {
+    [ -f "$(forward_file "$1")" ]
+}
+
+has_forwards() {
+    local file
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] && return 0
+    done
+    return 1
+}
+
+list_forwards_cli() {
+    local file
+    green "\n=== TCP/UDP 转发规则 ==="
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_forward_file "$file" || continue
+        [ -n "$TAG" ] && [ -n "$LOCAL_PORT" ] || continue
+        purple "${TAG} | ${PROTOCOL} | :${LOCAL_PORT} -> ${TARGET_ADDR}:${TARGET_PORT}"
+    done
+}
+
+forward_iptables_rules() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" proto_flag
+
+    for proto_flag in $protocol; do
+        iptables -t nat -C PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null ||
+            iptables -t nat -A PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}"
+        iptables -t nat -C POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null ||
+            iptables -t nat -A POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE
+    done
+}
+
+remove_forward_iptables_rules() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" proto_flag
+
+    for proto_flag in $protocol; do
+        iptables -t nat -D PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null || true
+        iptables -t nat -D POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null || true
+    done
+}
+
+write_forward_openrc_service() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name
+    service_name=$(forward_service_name "$tag")
+    cat > "/etc/init.d/${service_name}" << EOF
+#!/sbin/openrc-run
+
+description="sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})"
+command="/sbin/iptables"
+command_args=""
+pidfile="/var/run/${service_name}.pid"
+command_background=false
+
+depend() {
+    need net iptables
+}
+
+start() {
+    ebegin "Starting forward ${tag} (:${local_port} -> ${target_addr}:${target_port})"
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+EOF
+    for proto_flag in $protocol; do
+        cat >> "/etc/init.d/${service_name}" << EOF
+    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null ||
+        iptables -t nat -A PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port}
+    iptables -t nat -C POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null ||
+        iptables -t nat -A POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE
+EOF
+    done
+    cat >> "/etc/init.d/${service_name}" << EOF
+    eend 0
+}
+
+stop() {
+    ebegin "Stopping forward ${tag} (:${local_port} -> ${target_addr}:${target_port})"
+EOF
+    for proto_flag in $protocol; do
+        cat >> "/etc/init.d/${service_name}" << EOF
+    iptables -t nat -D PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null || true
+EOF
+    done
+    cat >> "/etc/init.d/${service_name}" << EOF
+    eend 0
+}
+
+status() {
+    local found=0
+EOF
+    for proto_flag in $protocol; do
+        cat >> "/etc/init.d/${service_name}" << EOF
+    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null && found=1
+EOF
+    done
+    cat >> "/etc/init.d/${service_name}" << EOF
+    [ "\$found" -eq 1 ] && ebegin "forward ${tag} is active" && eend 0 || eerror "forward ${tag} is not active"
+}
+EOF
+    chmod +x "/etc/init.d/${service_name}"
+}
+
+install_forward_service() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name
+    service_name=$(forward_service_name "$tag")
+    write_forward_openrc_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+    rc-update add "$service_name" default >/dev/null 2>&1
+    rc-service "$service_name" start
+}
+
+uninstall_forward_service() {
+    local tag="$1" service_name
+    service_name=$(forward_service_name "$tag")
+    if [ -f "/etc/init.d/${service_name}" ]; then
+        rc-service "$service_name" stop 2>/dev/null || true
+        rc-update del "$service_name" default 2>/dev/null || true
+        rm -f "/etc/init.d/${service_name}"
+    fi
+}
+
+add_forward() {
+    local tag protocol local_port target_addr target_port
+
+    reading "请输入转发规则名称（英文/数字）: " tag
+    tag=$(sanitize_tag "$tag")
+    [ -n "$tag" ] || { red "名称不能为空"; return 1; }
+    forward_exists "$tag" && { red "转发规则已存在: $tag"; return 1; }
+
+    reading "请选择协议 (tcp/udp/both，默认 tcp): " protocol
+    case "${protocol:-tcp}" in
+        tcp) protocol="tcp" ;;
+        udp) protocol="udp" ;;
+        both|tcp+udp|tcpudp) protocol="tcp udp" ;;
+        *) red "无效的协议: $protocol"; return 1 ;;
+    esac
+
+    reading "请输入本地监听端口: " local_port
+    validate_port "$local_port" || { red "端口范围需在 1-65535"; return 1; }
+
+    reading "请输入目标地址 (IP 或域名): " target_addr
+    [ -n "$target_addr" ] || { red "目标地址不能为空"; return 1; }
+
+    reading "请输入目标端口: " target_port
+    validate_port "$target_port" || { red "端口范围需在 1-65535"; return 1; }
+
+    # 检查本地端口是否已被其他转发占用
+    local file
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_forward_file "$file" || continue
+        [ "$LOCAL_PORT" = "$local_port" ] && { red "本地端口 ${local_port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
+    done
+
+    save_forward "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+
+    # 启用 IP 转发
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+
+    forward_iptables_rules "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+    install_forward_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+
+    green "转发规则已添加: ${tag} | ${protocol} | :${local_port} -> ${target_addr}:${target_port}"
+}
+
+delete_forward() {
+    local tag file service_name
+    ensure_state_layout
+    list_forwards_cli
+    has_forwards || { yellow "暂无转发规则。"; return 1; }
+
+    reading "请输入要删除的转发规则名称: " tag
+    tag=$(sanitize_tag "$tag")
+    file=$(forward_file "$tag")
+    [ -f "$file" ] || { red "转发规则不存在: $tag"; return 1; }
+
+    load_forward_file "$file"
+    uninstall_forward_service "$tag"
+    rm -f "$file"
+    green "转发规则已删除: $tag"
+}
+
+manage_forwards_menu() {
+    local choice
+    ensure_state_layout
+    clear_screen
+    green "=== TCP/UDP 转发管理 ===\n"
+    list_forwards_cli
+    echo
+    green "1. 添加 TCP/UDP 转发规则"
+    red "2. 删除转发规则"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " choice
+
+    case "$choice" in
+        1) add_forward ;;
+        2) delete_forward ;;
+        0) return ;;
+        *) red "无效的选项" ;;
+    esac
+}
+
 manage_route_menu() {
     local choice
     require_reality_state || return 1
@@ -1822,11 +2070,20 @@ manage_singbox() {
 }
 
 uninstall_singbox() {
-    local choice
+    local choice file
     reading "确定要卸载 sing-box 并删除 ${work_dir} 吗？(y/n): " choice
     case "$choice" in
         y|Y)
             yellow "正在卸载 sing-box..."
+
+            # 清理所有转发规则
+            for file in "$forwards_dir"/*.env; do
+                [ -f "$file" ] || continue
+                load_forward_file "$file" || continue
+                [ -n "$TAG" ] && uninstall_forward_service "$TAG" || true
+            done
+
+            # 清理服务
             if command_exists rc-service; then
                 rc-service sing-box stop >/dev/null 2>&1 || true
                 rc-update del sing-box default >/dev/null 2>&1 || true
@@ -1868,11 +2125,12 @@ menu() {
     green "3. 查看节点和落地摘要"
     green "4. 管理落地"
     green "5. 修改 Reality 设置"
-    green "6. sing-box 服务管理"
-    green "7. 查看 sing-box 日志"
-    red "8. 卸载 sing-box"
+    green "6. TCP/UDP 转发管理"
+    green "7. sing-box 服务管理"
+    green "8. 查看 sing-box 日志"
+    red "9. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-8): " choice
+    reading "请输入选择(0-9): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -1889,14 +2147,15 @@ while true; do
     case "$choice" in
         1) run_install_flow ;;
         2) import_outbound_auto ;;
-        3) show_reality_info ;;
+        3) show_reality_info; list_forwards_cli ;;
         4) manage_route_menu ;;
         5) manage_reality_settings_menu ;;
-        6) manage_singbox ;;
-        7) show_singbox_logs ;;
-        8) uninstall_singbox ;;
+        6) manage_forwards_menu ;;
+        7) manage_singbox ;;
+        8) show_singbox_logs ;;
+        9) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 8" ;;
+        *) red "无效的选项，请输入 0 到 9" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
