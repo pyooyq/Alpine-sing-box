@@ -1,6 +1,6 @@
 # Alpine-sing-box
 
-这是一个精简版 `sing-box` 安装/管理脚本，支持 VLESS Reality、普通 VLESS、Shadowsocks 入站，并支持多个入站按用户名绑定到不同 outbound。
+这是一个精简版 `sing-box` 安装/管理脚本，支持 VLESS Reality、普通 VLESS、Shadowsocks、Hysteria2 入站，并支持多个入站按用户名绑定到不同 outbound。
 
 ## 功能
 
@@ -14,8 +14,10 @@
 - 支持添加落地时自动创建并绑定用户
 - 支持手动添加带账号密码的 SOCKS5 落地并自动绑定用户
 - 支持从 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容自动导入落地并绑定用户
-- 支持自定义 Reality 端口和伪装域名/SNI
-- 支持 TCP/UDP 纯转发：通过 iptables DNAT 内核级转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者
+- 支持自定义 Reality 端口和伪装域名/SNI（交互式初始化节点时可回车使用默认值）
+- 支持额外增加入站（和初始化节点一样作为代理服务器，可添加多个；自动检测端口是否与已有入站/转发冲突）
+- 支持 Hysteria2 入站：自签名证书、默认随机高位端口、TLS，SNI 默认为当前 Reality 域名，可自定义端口和 SNI
+- 支持 TCP/UDP 纯转发：基于用户态 realm 转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者，无需 iptables（可在无 iptables / 无特权容器环境工作）
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
 - 不配置 Argo/Cloudflare Tunnel
@@ -69,7 +71,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持添加落地并自动绑定用户、查看节点摘要、管理落地、修改 Reality 设置、TCP/UDP 转发管理、启动/停止/重启 sing-box、查看日志、卸载。
+菜单支持添加落地并自动绑定用户、增加入站（代理服务器）、查看节点摘要、管理落地、修改 Reality 设置、TCP/UDP 转发管理、启动/停止/重启 sing-box、查看日志、卸载。
 
 ## 使用方式
 
@@ -79,7 +81,8 @@ sb
 
 1. 使用“添加落地并自动绑定用户”，直接粘贴 `ss://`、`vless://`、`http://`、`https://` 或其 base64 内容，脚本会自动识别协议并创建对应落地与默认 Reality 入站用户。
 2. 进入“管理落地”可导入落地、手动添加 SOCKS5、查看节点链接、列出落地或删除落地。
-3. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户路由到绑定的 outbound。
+3. 如需在本机新增代理服务入站（VLESS Reality / VLESS / Shadowsocks / Hysteria2，可添加多个），选择“增加入站（代理服务器）”并按提示选择协议、端口与绑定的 outbound；脚本会检测端口是否与已有入站或转发冲突。
+4. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户路由到绑定的 outbound。
 
 内置 outbound：
 
@@ -90,11 +93,11 @@ sb
 
 ## TCP/UDP 转发
 
-如需把当前 VPS 作为纯 TCP/UDP 转发器（不处理协议、不解析流量），可在主菜单选择 **6. TCP/UDP 转发管理** 添加转发规则：
+如需把当前 VPS 作为纯 TCP/UDP 转发器（不处理协议、不解析流量），可在主菜单选择 **7. TCP/UDP 转发管理** 添加转发规则：
 
 1. 输入规则名称，选择协议（`tcp` / `udp` / `both`）。
 2. 输入本地监听端口和目标地址:端口。
-3. 脚本自动写入 iptables DNAT 规则并生成独立的 OpenRC 服务（开机自启）。
+3. 脚本自动安装用户态转发工具 **realm** 并生成 `/etc/realm/config.json`，由 realm 服务（`/etc/systemd/system/realm.service` 或 `/etc/init.d/realm`，开机自启）接管所有转发。
 
 ```
 本地 :10086  ->  目标 1.2.3.4:443  (tcp udp)
@@ -102,13 +105,13 @@ sb
 
 特点：
 
-- 内核级转发，零用户态开销，客户端无需任何代理配置。
-- 每条规则对应一个独立 OpenRC 服务 `/etc/init.d/sing-box-forward-<tag>`，支持 `start` / `stop` / `status`。
+- 用户态级转发，无需 iptables，客户端无需任何代理配置；也可在无 iptables / 无特权容器环境工作。
+- 所有转发规则统一由单个 realm 服务接管，重载配置即可生效。
 - TCP 与 UDP 可分别或同时转发。
-- 删除规则会同时移除对应 iptables 规则和服务。
-- 卸载时会自动清理所有转发规则。
+- 删除规则会重写 realm 配置并重载服务；删除最后一条规则时会停用并移除 realm 服务。
+- 卸载时会自动清理 realm 服务与配置。
 
-> 注意：转发依赖 iptables 内核模块，适用于 Alpine/OpenRC 及大部分 Linux 发行版。
+> 注意：realm 为 `realm` 官方发布版本，适用于 Alpine/OpenRC 及大部分 Linux 发行版；目标地址支持 IPv4 / IPv6 / 域名。
 
 ## 说明
 

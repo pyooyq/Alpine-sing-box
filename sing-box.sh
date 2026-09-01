@@ -33,6 +33,7 @@ auto_install=0
 reality_inbound_tag="reality-in"
 vless_inbound_tag="vless-in"
 ss_inbound_tag="ss-in"
+hy2_inbound_tag="hy2-in"
 direct_outbound_tag="direct"
 block_outbound_tag="block"
 default_user_name="default-direct"
@@ -41,6 +42,13 @@ default_fingerprint="chrome"
 default_inbound_type="vless-reality"
 default_ss_method="aes-128-gcm"
 imported_outbound_tag=""
+# 用户态转发（realm）：替代内核 iptables DNAT，可在无 iptables / 无特权容器环境工作
+realm_bin="/usr/local/bin/realm"
+realm_config="/etc/realm/config.json"
+realm_work="/etc/realm"
+# Hysteria2 自签名证书（所有 hy2 入站共用；客户端通常以 insecure=1 连接，不校验证书）
+hy2_cert="${work_dir}/hy2-cert.pem"
+hy2_key="${work_dir}/hy2-key.pem"
 
 usage() {
     cat << EOF
@@ -79,7 +87,7 @@ validate_host_address() {
         addr="${addr%]}"
     fi
 
-    # 含冒号 -> 视为 IPv6（格式由 iptables 兜底校验）
+    # 含冒号 -> 视为 IPv6（最终由 realm/sing-box 解析校验）
     [[ "$addr" == *:* ]] && return 0
 
     # 否则应是主机名/域名或 IPv4：仅允许字母/数字/点/连字符/下划线，须以字母数字开头
@@ -168,6 +176,21 @@ split_hostport() {
 url_decode() {
     local value="${1//+/ }"
     printf '%b' "${value//%/\\x}" 2>/dev/null || printf '%s' "$1"
+}
+
+# 对 URI 组件做百分号编码（保留未保留字符与 '-' '_' '.' '~'），
+# 用于 hysteria2 链接中可能含特殊字符（如 base64 生成的密码）的片段
+url_encode() {
+    local value="$1" out="" i c
+    for ((i = 0; i < ${#value}; i++)); do
+        c="${value:i:1}"
+        case "$c" in
+            [a-zA-Z0-9._~-]) out="${out}${c}" ;;
+            ' ') out="${out}%20" ;;
+            *) printf -v hex '%02X' "'$c" 2>/dev/null && out="${out}%${hex}" || out="${out}${c}" ;;
+        esac
+    done
+    printf '%s' "$out"
 }
 
 b64_decode() {
@@ -319,10 +342,6 @@ forward_file() {
     printf '%s/%s.env' "$forwards_dir" "$(sanitize_tag "$1")"
 }
 
-forward_service_name() {
-    printf 'sing-box-forward-%s' "$(sanitize_tag "$1")"
-}
-
 has_users() {
     local file
     for file in "$users_dir"/*.env; do
@@ -373,7 +392,7 @@ load_user_file() {
     esac
     # 保证 Reality 用户端口解析前 PORT 已加载（避免在 load_state 之前调用时的空端口）
     [ -n "$PORT" ] || load_state
-    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD
+    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD H2_SNI
     NAME=$(read_env_value "$file" NAME || true)
     UUID=$(read_env_value "$file" UUID || true)
     FLOW=$(read_env_value "$file" FLOW || true)
@@ -382,6 +401,7 @@ load_user_file() {
     INBOUND_PORT=$(read_env_value "$file" INBOUND_PORT || true)
     METHOD=$(read_env_value "$file" METHOD || true)
     PASSWORD=$(read_env_value "$file" PASSWORD || true)
+    H2_SNI=$(read_env_value "$file" H2_SNI || true)
     FLOW="${FLOW:-$default_flow}"
     OUTBOUND_TAG="${OUTBOUND_TAG:-$direct_outbound_tag}"
     INBOUND_TYPE="${INBOUND_TYPE:-$default_inbound_type}"
@@ -393,6 +413,7 @@ load_user_file() {
         INBOUND_PORT="${INBOUND_PORT:-}"
     fi
     METHOD="${METHOD:-$default_ss_method}"
+    H2_SNI="${H2_SNI:-$REALITY_DOMAIN}"
 }
 
 load_outbound_file() {
@@ -435,7 +456,7 @@ load_outbound_file() {
 }
 
 save_user() {
-    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" file
+    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" file
     name=$(sanitize_tag "$name")
     file=$(user_file "$name")
     {
@@ -447,6 +468,7 @@ save_user() {
         write_env_line INBOUND_PORT "$inbound_port"
         write_env_line METHOD "$method"
         write_env_line PASSWORD "$password"
+        [ -n "$sni" ] && write_env_line H2_SNI "$sni"
     } > "$file"
     chmod 600 "$file"
 }
@@ -727,6 +749,25 @@ generate_password() {
     od -An -N32 -tx1 /dev/urandom | tr -d ' \n'
 }
 
+# 生成 Hysteria2 自签名证书（所有 hy2 入站共用；客户端以 insecure=1 连接，不校验证书）
+ensure_hy2_cert() {
+    local sni="${1:-$REALITY_DOMAIN}"
+    [ -f "$hy2_cert" ] && [ -f "$hy2_key" ] && return 0
+    command_exists openssl || manage_packages install openssl >/dev/null 2>&1
+    command_exists openssl || { red "需要 openssl 生成 Hysteria2 自签名证书，请先安装 openssl 后重试。"; return 1; }
+    mkdir -p "$work_dir"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+        -keyout "$hy2_key" -out "$hy2_cert" -days 3650 -nodes \
+        -subj "/CN=${sni}" 2>/dev/null
+    if [ -f "$hy2_cert" ] && [ -f "$hy2_key" ]; then
+        chmod 600 "$hy2_key"
+        chmod 644 "$hy2_cert"
+        return 0
+    fi
+    red "生成 Hysteria2 自签名证书失败。"
+    return 1
+}
+
 generate_reality_values() {
     local output
 
@@ -767,6 +808,7 @@ inbound_tag_for_user() {
     case "$inbound_type" in
         vless) printf '%s-%s' "$vless_inbound_tag" "$name" ;;
         shadowsocks) printf '%s-%s' "$ss_inbound_tag" "$name" ;;
+        hysteria2) printf '%s-%s' "$hy2_inbound_tag" "$name" ;;
         *) printf '%s' "$reality_inbound_tag" ;;
     esac
 }
@@ -781,6 +823,9 @@ has_inbound_type() {
             shadowsocks)
                 [ -n "$NAME" ] && [ -n "$PASSWORD" ] && validate_port "$INBOUND_PORT" && return 0
                 ;;
+            hysteria2)
+                [ -n "$NAME" ] && [ -n "$PASSWORD" ] && validate_port "$INBOUND_PORT" && return 0
+                ;;
             *)
                 [ -n "$NAME" ] && [ -n "$UUID" ] && validate_port "$INBOUND_PORT" && return 0
                 ;;
@@ -790,7 +835,7 @@ has_inbound_type() {
 }
 
 render_inbounds_json() {
-    local file first=1 name uuid inbound_type inbound_port inbound_tag password method
+    local file first=1 name uuid inbound_type inbound_port inbound_tag password method sni
     if has_inbound_type "vless-reality"; then
         [ "$first" -eq 1 ] || printf ',\n'
         first=0
@@ -864,6 +909,33 @@ EOF
       "listen_port": ${inbound_port},
       "method": $(json_string "$method"),
       "password": $(json_string "$password")
+    }
+EOF
+                ;;
+            hysteria2)
+                password="$PASSWORD"
+                sni="${H2_SNI:-$REALITY_DOMAIN}"
+                [ -n "$name" ] && [ -n "$password" ] && validate_port "$inbound_port" || continue
+                [ "$first" -eq 1 ] || printf ',\n'
+                first=0
+                cat << EOF
+    {
+      "type": "hysteria2",
+      "tag": "${inbound_tag}",
+      "listen": "::",
+      "listen_port": ${inbound_port},
+      "users": [
+        {
+          "name": $(json_string "$name"),
+          "password": $(json_string "$password")
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": $(json_string "$sni"),
+        "key_path": "$(json_escape "$hy2_key")",
+        "certificate_path": "$(json_escape "$hy2_cert")"
+      }
     }
 EOF
                 ;;
@@ -1202,9 +1274,10 @@ get_server_ip() {
 }
 
 user_link() {
-    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" link userinfo
+    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" link userinfo
     load_state
     [ -n "$server_ip" ] || server_ip=$(get_server_ip)
+    [ -n "$sni" ] || sni="$REALITY_DOMAIN"
     case "$inbound_type" in
         vless)
             link="vless://${uuid}@${server_ip}:${inbound_port}?encryption=none&security=none&type=tcp&headerType=none#${name}"
@@ -1212,6 +1285,9 @@ user_link() {
         shadowsocks)
             userinfo=$(printf '%s:%s' "$method" "$password" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
             link="ss://${userinfo}@${server_ip}:${inbound_port}#${name}"
+            ;;
+        hysteria2)
+            link="hysteria2://$(url_encode "$password")@${server_ip}:${inbound_port}?sni=${sni}&insecure=1#${name}"
             ;;
         *)
             link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${flow:-$default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
@@ -1240,7 +1316,8 @@ list_users() {
         load_user_file "$file"
         [ -n "$NAME" ] || continue
         [ "$INBOUND_TYPE" = "shadowsocks" ] && [ -z "$PASSWORD" ] && continue
-        [ "$INBOUND_TYPE" != "shadowsocks" ] && [ -z "$UUID" ] && continue
+        [ "$INBOUND_TYPE" = "hysteria2" ] && [ -z "$PASSWORD" ] && continue
+        { [ "$INBOUND_TYPE" != "shadowsocks" ] && [ "$INBOUND_TYPE" != "hysteria2" ]; } && [ -z "$UUID" ] && continue
         purple "${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}"
     done
 }
@@ -1266,7 +1343,7 @@ show_reality_info() {
         [ -f "$file" ] || continue
         load_user_file "$file"
         [ -n "$NAME" ] || continue
-        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT")
+        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")
         purple "${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}"
         purple "$link\n"
     done
@@ -1347,6 +1424,18 @@ EOF
     green "快捷指令 sb 创建成功，后续可输入 sb 打开脚本。"
 }
 
+prompt_reality_settings() {
+    local p
+    reading "请输入 Reality 端口（回车随机，默认 ${PORT}）: " p
+    [ -n "$p" ] || p="$PORT"
+    validate_port "$p" || { red "端口范围需在 1-65535"; return 1; }
+    PORT="$p"
+    reading "请输入 Reality 伪装域名/SNI（回车默认 ${REALITY_DOMAIN}）: " p
+    [ -n "$p" ] || p="$REALITY_DOMAIN"
+    validate_domain "$p" || { red "域名需为包含点的 FQDN，且只能包含字母、数字、点或连字符。"; return 1; }
+    REALITY_DOMAIN="$p"
+}
+
 run_install_flow() {
     local uuid
     if [ -f "$state_file" ] && [ -x "${work_dir}/${server_name}" ]; then
@@ -1369,6 +1458,9 @@ run_install_flow() {
 
     PORT="$vless_port"
     REALITY_DOMAIN="$reality_domain"
+    if [ "$auto_install" -eq 0 ]; then
+        prompt_reality_settings || exit 1
+    fi
     generate_reality_values
     save_state
     if [ "$auto_install" -eq 1 ]; then
@@ -1462,11 +1554,13 @@ select_inbound_type() {
     purple "1. VLESS + Reality（推荐，当前默认配置）"
     purple "2. VLESS（无 Reality/TLS）"
     purple "3. Shadowsocks"
+    purple "4. Hysteria2（自签名 TLS，默认随机高位端口）"
     reading "请输入编号（默认 1）: " choice
     case "${choice:-1}" in
         1) SELECTED_INBOUND_TYPE="vless-reality" ;;
         2) SELECTED_INBOUND_TYPE="vless" ;;
         3) SELECTED_INBOUND_TYPE="shadowsocks" ;;
+        4) SELECTED_INBOUND_TYPE="hysteria2" ;;
         *) red "无效的入站协议。"; return 1 ;;
     esac
 }
@@ -1475,12 +1569,13 @@ inbound_label() {
     case "$1" in
         vless) printf 'VLESS' ;;
         shadowsocks) printf 'SS' ;;
+        hysteria2) printf 'HY2' ;;
         *) printf 'VLESS+Reality' ;;
     esac
 }
 
 select_inbound_port() {
-    local inbound_type="$1" port
+    local inbound_type="$1" port file
     if [ "$inbound_type" = "vless-reality" ]; then
         SELECTED_INBOUND_PORT="$PORT"
         return 0
@@ -1492,6 +1587,12 @@ select_inbound_port() {
         red "端口已被现有入站占用: $port"
         return 1
     fi
+    # 亦不能与 TCP/UDP 转发的本地监听端口冲突
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_forward_file "$file" || continue
+        [ "$LOCAL_PORT" = "$port" ] && { red "端口 ${port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
+    done
     SELECTED_INBOUND_PORT="$port"
 }
 
@@ -1500,9 +1601,15 @@ select_inbound_profile() {
     select_inbound_port "$SELECTED_INBOUND_TYPE" || return 1
     SELECTED_INBOUND_PASSWORD=""
     SELECTED_INBOUND_METHOD="$default_ss_method"
+    SELECTED_INBOUND_SNI=""
     if [ "$SELECTED_INBOUND_TYPE" = "shadowsocks" ]; then
         reading "请输入 SS 入站密码（留空自动生成）: " SELECTED_INBOUND_PASSWORD
         [ -n "$SELECTED_INBOUND_PASSWORD" ] || SELECTED_INBOUND_PASSWORD=$(generate_password)
+    elif [ "$SELECTED_INBOUND_TYPE" = "hysteria2" ]; then
+        reading "请输入 Hysteria2 入站密码（留空自动生成）: " SELECTED_INBOUND_PASSWORD
+        [ -n "$SELECTED_INBOUND_PASSWORD" ] || SELECTED_INBOUND_PASSWORD=$(generate_password)
+        reading "请输入 HY2 SNI（回车默认 ${REALITY_DOMAIN}）: " SELECTED_INBOUND_SNI
+        [ -n "$SELECTED_INBOUND_SNI" ] || SELECTED_INBOUND_SNI="$REALITY_DOMAIN"
     fi
 }
 
@@ -1511,10 +1618,14 @@ use_default_inbound_profile() {
     SELECTED_INBOUND_PORT="$PORT"
     SELECTED_INBOUND_PASSWORD=""
     SELECTED_INBOUND_METHOD="$default_ss_method"
+    SELECTED_INBOUND_SNI=""
 }
 
 save_selected_user() {
-    save_user "$1" "$2" "$3" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT"
+    if [ "$SELECTED_INBOUND_TYPE" = "hysteria2" ]; then
+        ensure_hy2_cert "${SELECTED_INBOUND_SNI:-$REALITY_DOMAIN}" || return 1
+    fi
+    save_user "$1" "$2" "$3" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}"
 }
 
 create_bound_user_for_outbound() {
@@ -1541,7 +1652,44 @@ create_bound_user_for_outbound() {
 
     allow_port "$SELECTED_INBOUND_PORT"
     green "已添加落地并自动绑定用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT")\n"
+    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
+}
+
+add_inbound() {
+    local name uuid outbound_tag status
+    require_reality_state || return 1
+    list_outbounds
+
+    select_inbound_profile || return 1
+
+    reading "请输入入站用户名（英文/数字，仅用于标识本站入站）: " name
+    name=$(sanitize_tag "$name")
+    [ -n "$name" ] || { red "用户名不能为空"; return 1; }
+    user_exists "$name" && { red "用户已存在: $name"; return 1; }
+
+    reading "请输入要绑定的 outbound tag（回车默认 ${direct_outbound_tag}）: " outbound_tag
+    [ -n "$outbound_tag" ] || outbound_tag="$direct_outbound_tag"
+    outbound_exists "$outbound_tag" || { red "outbound 不存在: $outbound_tag"; return 1; }
+
+    if [ "$SELECTED_INBOUND_TYPE" = "hysteria2" ]; then
+        ensure_hy2_cert "${SELECTED_INBOUND_SNI:-$REALITY_DOMAIN}" || return 1
+    fi
+
+    uuid=$(generate_uuid)
+    save_user "$name" "$uuid" "$outbound_tag" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}"
+
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$(user_file "$name")"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    allow_port "$SELECTED_INBOUND_PORT"
+    green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
+    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
 }
 
 add_socks_outbound() {
@@ -1807,7 +1955,7 @@ delete_outbound() {
     fi
 }
 
-# ── TCP/UDP 转发（iptables DNAT） ──────────────────────────────────
+# ── TCP/UDP 转发（realm 用户态） ────────────────────────────────────
 
 load_forward_file() {
     local file="$1"
@@ -1861,211 +2009,173 @@ list_forwards_cli() {
     done
 }
 
-forward_iptables_rules() {
-    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" proto_flag
-
-    for proto_flag in $protocol; do
-        iptables -t nat -C PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null ||
-            iptables -t nat -A PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}"
-        iptables -t nat -C POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null ||
-            iptables -t nat -A POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE
-        # 被 DNAT 的包走 FORWARD 链（而非 INPUT/OUTPUT）。若 FORWARD 默认策略是 DROP，
-        # 需显式放行到目标的出向包与来自目标的回向包，否则转发会被丢弃。
-        iptables -C FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT 2>/dev/null ||
-            iptables -A FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT
-        # 回程包来源端口可能不是 target_port（如 UDP 临时端口），按目标地址用 conntrack 放行已建立/相关连接
-        iptables -C FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-            iptables -A FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-    done
+# realm 目标映射（realm release 资产命名）
+realm_target_for_arch() {
+    local arch="$1" libc
+    if command_exists apk; then libc="unknown-linux-musl"; else libc="unknown-linux-gnu"; fi
+    case "$arch" in
+        amd64) arch="x86_64" ;;
+        arm64) arch="aarch64" ;;
+        386)   arch="i686" ;;
+        armv7) arch="armv7"; libc="unknown-linux-musleabihf" ;;
+        *) return 1 ;;
+    esac
+    printf '%s-%s' "$arch" "$libc"
 }
 
-remove_forward_iptables_rules() {
-    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" proto_flag
-
-    for proto_flag in $protocol; do
-        iptables -t nat -D PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null || true
-        iptables -t nat -D POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null || true
-        iptables -D FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT 2>/dev/null || true
-        iptables -D FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    done
-}
-
-write_forward_openrc_service() {
-    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name
-    service_name=$(forward_service_name "$tag")
-    cat > "/etc/init.d/${service_name}" << EOF
-#!/sbin/openrc-run
-
-description="sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})"
-command="/sbin/iptables"
-command_args=""
-pidfile="/var/run/${service_name}.pid"
-command_background=false
-
-depend() {
-    # 不依赖 iptables 服务：部分系统未安装/未启用 iptables OpenRC 服务会阻塞启动
-    need net
-}
-
-start() {
-    ebegin "Starting forward ${tag} (:${local_port} -> ${target_addr}:${target_port})"
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-EOF
-    for proto_flag in $protocol; do
-        cat >> "/etc/init.d/${service_name}" << EOF
-    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null ||
-        iptables -t nat -A PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port}
-    iptables -t nat -C POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null ||
-        iptables -t nat -A POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE
-    iptables -C FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT
-    iptables -C FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-EOF
-    done
-    cat >> "/etc/init.d/${service_name}" << EOF
-    eend 0
-}
-
-stop() {
-    ebegin "Stopping forward ${tag} (:${local_port} -> ${target_addr}:${target_port})"
-EOF
-    for proto_flag in $protocol; do
-        cat >> "/etc/init.d/${service_name}" << EOF
-    iptables -t nat -D PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-EOF
-    done
-    cat >> "/etc/init.d/${service_name}" << EOF
-    eend 0
-}
-
-status() {
-    local found=0
-EOF
-    for proto_flag in $protocol; do
-        cat >> "/etc/init.d/${service_name}" << EOF
-    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null && found=1
-EOF
-    done
-    cat >> "/etc/init.d/${service_name}" << EOF
-    if [ "\$found" -eq 1 ]; then
-        ebegin "forward ${tag} is active" && eend 0
-    else
-        eerror "forward ${tag} is not active"
-        return 1
+install_realm() {
+    local arch target latest tmp_dir dl_url realm_file
+    [ -x "$realm_bin" ] && return 0
+    arch=$(detect_arch)
+    target=$(realm_target_for_arch "$arch") || { red "realm 暂不支持该架构: $(uname -m)"; return 1; }
+    latest=$(curl -fsSL "https://api.github.com/repos/zhboner/realm/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)
+    [ -n "$latest" ] || { red "获取 realm 版本失败"; return 1; }
+    tmp_dir=$(mktemp -d)
+    dl_url="https://github.com/zhboner/realm/releases/download/v${latest}/realm-${target}.tar.gz"
+    yellow "下载 realm v${latest} (${target})..."
+    if ! curl -fL --retry 3 -o "$tmp_dir/realm.tar.gz" "$dl_url"; then
+        case "$target" in
+            *-gnu)      target="${target%-gnu}-unknown-linux-musl" ;;
+            *-musleabihf) target="${target%-unknown-linux-musleabihf}-unknown-linux-gnu" ;;
+            *-musl)     target="${target%-unknown-linux-musl}-unknown-linux-gnu" ;;
+        esac
+        dl_url="https://github.com/zhboner/realm/releases/download/v${latest}/realm-${target}.tar.gz"
+        yellow "回退尝试 libc: ${target}"
+        curl -fL --retry 3 -o "$tmp_dir/realm.tar.gz" "$dl_url" || { rm -rf "$tmp_dir"; red "realm 下载失败"; return 1; }
     fi
-}
-EOF
-    chmod +x "/etc/init.d/${service_name}"
-}
-
-install_forward_service() {
-    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name
-    service_name=$(forward_service_name "$tag")
-    if command_exists rc-service && command_exists rc-update; then
-        write_forward_openrc_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
-        rc-update add "$service_name" default >/dev/null 2>&1
-        rc-service "$service_name" start
-    elif command_exists systemctl; then
-        write_forward_systemd_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
-    else
-        yellow "未检测到 OpenRC 或 systemd，无法设置转发服务开机自启；iptables 规则已生效，重启后需手动重加。"
-    fi
+    tar -xzf "$tmp_dir/realm.tar.gz" -C "$tmp_dir" 2>/dev/null || { rm -rf "$tmp_dir"; red "解压 realm 失败"; return 1; }
+    mkdir -p "$realm_work"
+    realm_file="$tmp_dir/realm"
+    [ -f "$realm_file" ] || realm_file=$(find "$tmp_dir" -type f -name realm 2>/dev/null | head -n 1)
+    [ -n "$realm_file" ] && [ -f "$realm_file" ] || { rm -rf "$tmp_dir"; red "未在压缩包中找到 realm 可执行文件"; return 1; }
+    mv "$realm_file" "$realm_bin"
+    chmod +x "$realm_bin"
+    rm -rf "$tmp_dir"
+    green "realm 已安装: $realm_bin"
 }
 
-write_forward_systemd_service() {
-    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name wrapper service_file
-    service_name=$(forward_service_name "$tag")
-    wrapper="${work_dir}/${service_name}.sh"
-    service_file="/etc/systemd/system/${service_name}.service"
+require_realm() {
+    [ -x "$realm_bin" ] || install_realm || { yellow "realm 不可用，无法启用用户态转发。"; return 1; }
+    return 0
+}
+
+write_realm_config() {
+    local file first=1 tag protocol local_port target_addr target_port no_tcp use_udp remote
+    mkdir -p "$realm_work"
     {
-        cat << EOF
-#!/bin/sh
-# sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})
-case "\$1" in
-  start)
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-EOF
-        for proto_flag in $protocol; do
-            cat << EOF
-    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null ||
-        iptables -t nat -A PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port}
-    iptables -t nat -C POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null ||
-        iptables -t nat -A POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE
-    iptables -C FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT
-    iptables -C FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-EOF
+        printf '{\n  "log": { "level": "warn" },\n  "endpoints": [\n'
+        for file in "$forwards_dir"/*.env; do
+            [ -f "$file" ] || continue
+            load_forward_file "$file" || continue
+            tag="$TAG"; protocol="$PROTOCOL"; local_port="$LOCAL_PORT"
+            target_addr="$TARGET_ADDR"; target_port="$TARGET_PORT"
+            [ -n "$tag" ] && validate_port "$local_port" || continue
+            [ -z "$protocol" ] && protocol="tcp udp"
+            # 目标为 IPv6 时需加方括号，如 [2001:db8::1]:443；先去掉用户可能已输入的方括号
+            remote="$target_addr"
+            remote="${remote#[}"; remote="${remote%]}"
+            [[ "$remote" == *:* ]] && remote="[${remote}]"
+            remote="${remote}:${target_port}"
+            [ "$first" -eq 1 ] || printf ',\n'
+            first=0
+            case " $protocol " in *tcp*) no_tcp=false ;; *) no_tcp=true ;; esac
+            case " $protocol " in *udp*) use_udp=true ;; *) use_udp=false ;; esac
+            printf '    {\n'
+            printf '      "listen": %s,\n' "$(json_string "0.0.0.0:${local_port}")"
+            printf '      "remote": %s,\n' "$(json_string "$remote")"
+            printf '      "network": { "no_tcp": %s, "use_udp": %s }\n' "$no_tcp" "$use_udp"
+            printf '    }'
         done
-        cat << EOF
-    ;;
-  stop)
-EOF
-        for proto_flag in $protocol; do
-            cat << EOF
-    iptables -t nat -D PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-EOF
-        done
-        cat << EOF
-    ;;
-  status)
-    found=0
-EOF
-        for proto_flag in $protocol; do
-            cat << EOF
-    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null && found=1
-EOF
-        done
-        cat << EOF
-    [ "\$found" -eq 1 ] && echo "forward ${tag} is active" && exit 0 || { echo "forward ${tag} is not active" >&2; exit 1; }
-    ;;
-  *) echo "usage: \$0 {start|stop|status}" >&2; exit 1 ;;
-esac
-EOF
-    } > "$wrapper"
-    chmod +x "$wrapper"
+        printf '\n  ]\n}\n'
+    } > "$realm_config"
+    chmod 600 "$realm_config"
+}
 
-    cat > "$service_file" << EOF
+# 无 systemd/OpenRC 时的兜底：以直连后台进程方式运行 realm（适用于无 init 的容器）
+realm_direct_pid() {
+    printf '%s/realm.pid' "$realm_work"
+}
+
+stop_realm_direct() {
+    local pidfile pid
+    pidfile=$(realm_direct_pid)
+    [ -f "$pidfile" ] || return 0
+    pid=$(cat "$pidfile" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+}
+
+start_realm_direct() {
+    local pidfile
+    mkdir -p "$realm_work"
+    pidfile=$(realm_direct_pid)
+    stop_realm_direct
+    nohup "$realm_bin" -c "$realm_config" >/dev/null 2>&1 &
+    echo $! > "$pidfile"
+    sleep 1
+}
+
+restart_realm() {
+    if command_exists systemctl && [ -f /etc/systemd/system/realm.service ]; then
+        systemctl restart realm 2>/dev/null
+    elif command_exists rc-service && [ -f /etc/init.d/realm ]; then
+        rc-service realm restart 2>/dev/null
+    else
+        start_realm_direct
+    fi
+}
+
+install_realm_service() {
+    if command_exists systemctl; then
+        cat > /etc/systemd/system/realm.service << EOF
 [Unit]
-Description=sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})
+Description=realm TCP/UDP forward
 After=network.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=${wrapper} start
-ExecStop=${wrapper} stop
+Type=simple
+ExecStart=${realm_bin} -c ${realm_config}
+Restart=on-failure
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now "${service_name}.service"
+        systemctl daemon-reload
+        systemctl enable --now realm
+    elif command_exists rc-service && command_exists rc-update; then
+        cat > /etc/init.d/realm << EOF
+#!/sbin/openrc-run
+description="realm TCP/UDP forward"
+command="${realm_bin}"
+command_args="-c ${realm_config}"
+command_background=true
+pidfile="/run/realm.pid"
+depend() { need net; }
+EOF
+        chmod +x /etc/init.d/realm
+        rc-update add realm default >/dev/null 2>&1
+        rc-service realm restart
+    else
+        yellow "未检测到 systemd/OpenRC，realm 以后台进程方式运行（容器重启后需再次添加转发以拉起）。"
+        start_realm_direct
+        return 0
+    fi
 }
 
-uninstall_forward_service() {
-    local tag="$1" service_name
-    service_name=$(forward_service_name "$tag")
-    if [ -f "/etc/init.d/${service_name}" ]; then
-        rc-service "$service_name" stop 2>/dev/null || true
-        rc-update del "$service_name" default 2>/dev/null || true
-        rm -f "/etc/init.d/${service_name}"
-    fi
-    if [ -f "/etc/systemd/system/${service_name}.service" ]; then
-        systemctl disable --now "${service_name}.service" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${service_name}.service"
+uninstall_realm_service() {
+    if command_exists systemctl && [ -f /etc/systemd/system/realm.service ]; then
+        systemctl disable --now realm 2>/dev/null || true
+        rm -f /etc/systemd/system/realm.service
         systemctl daemon-reload 2>/dev/null || true
     fi
-    rm -f "${work_dir}/${service_name}.sh"
+    if command_exists rc-service && [ -f /etc/init.d/realm ]; then
+        rc-service realm stop 2>/dev/null || true
+        rc-update del realm default 2>/dev/null || true
+        rm -f /etc/init.d/realm
+    fi
+    stop_realm_direct
+    rm -rf "$realm_work" 2>/dev/null || true
 }
 
 add_forward() {
@@ -2090,8 +2200,7 @@ add_forward() {
 
     reading "请输入目标地址 (IP 或域名): " target_addr
     validate_host_address "$target_addr" || { red "目标地址无效。"; return 1; }
-    # 转发走 iptables（IPv4 DNAT），暂不支持 IPv6 目标地址
-    [[ "$target_addr" == *:* ]] && { red "当前仅支持 IPv4/域名目标地址，不支持 IPv6。"; return 1; }
+    # 用户态 realm 转发，支持 IPv4/IPv6/域名目标地址
 
     reading "请输入目标端口: " target_port
     validate_port "$target_port" || { red "端口范围需在 1-65535"; return 1; }
@@ -2112,19 +2221,23 @@ add_forward() {
 
     save_forward "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
 
-    # 启用 IP 转发
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
-
-    forward_iptables_rules "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+    if ! require_realm; then
+        rm -f "$(forward_file "$tag")"
+        return 1
+    fi
+    write_realm_config
+    if [ -f /etc/systemd/system/realm.service ] || [ -f /etc/init.d/realm ]; then
+        restart_realm
+    else
+        install_realm_service || { rm -f "$(forward_file "$tag")"; return 1; }
+    fi
     allow_port "$local_port" "$protocol"
-    install_forward_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
 
-    green "转发规则已添加: ${tag} | ${protocol} | :${local_port} -> ${target_addr}:${target_port}"
+    green "转发规则已添加: ${tag} | ${protocol} | :${local_port} -> ${target_addr}:${target_port} (用户态 realm)"
 }
 
 delete_forward() {
-    local tag file service_name
+    local tag file
     ensure_state_layout
     list_forwards_cli
     has_forwards || { yellow "暂无转发规则。"; return 1; }
@@ -2134,11 +2247,13 @@ delete_forward() {
     file=$(forward_file "$tag")
     [ -f "$file" ] || { red "转发规则不存在: $tag"; return 1; }
 
-    load_forward_file "$file"
-    uninstall_forward_service "$tag"
-    # 兜底：即使 OpenRC 服务缺失，也直接删除 iptables 规则，避免残留
-    remove_forward_iptables_rules "$TAG" "$PROTOCOL" "$LOCAL_PORT" "$TARGET_ADDR" "$TARGET_PORT"
     rm -f "$file"
+    if has_forwards; then
+        write_realm_config
+        restart_realm
+    else
+        uninstall_realm_service
+    fi
     green "转发规则已删除: $tag"
 }
 
@@ -2235,14 +2350,8 @@ uninstall_singbox() {
         y|Y)
             yellow "正在卸载 sing-box..."
 
-            # 清理所有转发规则（iptables 规则 + OpenRC 服务）
-            for file in "$forwards_dir"/*.env; do
-                [ -f "$file" ] || continue
-                load_forward_file "$file" || continue
-                [ -n "$TAG" ] || continue
-                remove_forward_iptables_rules "$TAG" "$PROTOCOL" "$LOCAL_PORT" "$TARGET_ADDR" "$TARGET_PORT"
-                uninstall_forward_service "$TAG"
-            done
+            # 清理所有转发规则（realm 服务 + 配置）
+            uninstall_realm_service
 
             # 清理服务
             if command_exists rc-service; then
@@ -2285,15 +2394,16 @@ menu() {
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
     green "2. 添加落地并自动绑定用户"
-    green "3. 查看节点和落地摘要"
-    green "4. 管理落地"
-    green "5. 修改 Reality 设置"
-    green "6. TCP/UDP 转发管理"
-    green "7. sing-box 服务管理"
-    green "8. 查看 sing-box 日志"
-    red "9. 卸载 sing-box"
+    green "3. 增加入站（代理服务器）"
+    green "4. 查看节点和落地摘要"
+    green "5. 管理落地"
+    green "6. 修改 Reality 设置"
+    green "7. TCP/UDP 转发管理"
+    green "8. sing-box 服务管理"
+    green "9. 查看 sing-box 日志"
+    red "10. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-9): " choice
+    reading "请输入选择(0-10): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -2310,15 +2420,16 @@ while true; do
     case "$choice" in
         1) run_install_flow ;;
         2) import_outbound_auto ;;
-        3) show_reality_info; list_forwards_cli ;;
-        4) manage_route_menu ;;
-        5) manage_reality_settings_menu ;;
-        6) manage_forwards_menu ;;
-        7) manage_singbox ;;
-        8) show_singbox_logs ;;
-        9) uninstall_singbox ;;
+        3) add_inbound ;;
+        4) show_reality_info; list_forwards_cli ;;
+        5) manage_route_menu ;;
+        6) manage_reality_settings_menu ;;
+        7) manage_forwards_menu ;;
+        8) manage_singbox ;;
+        9) show_singbox_logs ;;
+        10) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 9" ;;
+        *) red "无效的选项，请输入 0 到 10" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
