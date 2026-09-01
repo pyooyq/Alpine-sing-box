@@ -361,7 +361,10 @@ outbound_exists() {
 
 inbound_port_in_use() {
     local port="$1" skip_user="${2:-}" file
-    [ "$port" = "$PORT" ] && return 0
+    # 仅当确实存在 Reality 入站时，主端口 PORT 才视为已占用（初始化选非 Reality 协议时 PORT 仅为占位值）
+    if has_inbound_type "vless-reality" && [ "$port" = "$PORT" ]; then
+        return 0
+    fi
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
@@ -1308,6 +1311,92 @@ list_outbounds() {
     done
 }
 
+# 判定某个已 load_user_file 的用户是否为可见、可管理的入站（过滤缺字段的脏数据）
+user_is_visible() {
+    [ -n "$NAME" ] || return 1
+    [ "$INBOUND_TYPE" = "shadowsocks" ] && [ -z "$PASSWORD" ] && return 1
+    [ "$INBOUND_TYPE" = "hysteria2" ] && [ -z "$PASSWORD" ] && return 1
+    { [ "$INBOUND_TYPE" != "shadowsocks" ] && [ "$INBOUND_TYPE" != "hysteria2" ]; } && [ -z "$UUID" ] && return 1
+    return 0
+}
+
+# 收集可见入站用户名到全局数组 INBOUND_NAMES
+collect_inbound_names() {
+    local file
+    INBOUND_NAMES=()
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        INBOUND_NAMES+=("$NAME")
+    done
+}
+
+# 收集落地 outbound tag（不含内置 direct/block）到全局数组 OUTBOUND_TAGS
+collect_outbound_tags() {
+    local file
+    OUTBOUND_TAGS=()
+    for file in "$outbounds_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_outbound_file "$file" || continue
+        [ -n "$TAG" ] && [ -n "$TYPE" ] || continue
+        OUTBOUND_TAGS+=("$TAG")
+    done
+}
+
+# 打印带序号的入站列表（依赖 collect_inbound_names 已执行）
+list_inbounds_numbered() {
+    local i name
+    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+        purple "（暂无入站）"
+        return 0
+    fi
+    green "\n=== 现有入站 ===\n"
+    for i in "${!INBOUND_NAMES[@]}"; do
+        name="${INBOUND_NAMES[$i]}"
+        load_user_file "$(user_file "$name")"
+        purple "$((i + 1))) ${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}"
+    done
+}
+
+# 打印带序号的落地列表（依赖 collect_outbound_tags 已执行）
+list_outbounds_numbered() {
+    local i tag users
+    if [ "${#OUTBOUND_TAGS[@]}" -eq 0 ]; then
+        purple "（暂无落地）"
+        return 0
+    fi
+    green "\n=== 落地列表 ===\n"
+    for i in "${!OUTBOUND_TAGS[@]}"; do
+        tag="${OUTBOUND_TAGS[$i]}"
+        load_outbound_file "$(outbound_file "$tag")" || continue
+        users=$(users_for_outbound "$tag")
+        purple "$((i + 1))) ${TAG} | ${TYPE} | ${DISPLAY_NAME:-$SERVER:$SERVER_PORT} | 入站=${users:-无}"
+    done
+}
+
+# 读取一个 1..total 的序号到全局 PICKED_INDEX
+pick_index() {
+    local total="$1" sel
+    reading "请输入序号: " sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || { red "无效序号。"; return 1; }
+    [ "$sel" -ge 1 ] && [ "$sel" -le "$total" ] || { red "序号需在 1 到 ${total} 之间。"; return 1; }
+    PICKED_INDEX="$sel"
+}
+
+# 除指定用户外，是否还存在其他可见入站（用于删除的最后一条保护）
+has_more_inbound_users() {
+    local skip="$1" file count=0
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        [ "$NAME" = "$skip" ] && continue
+        count=$((count + 1))
+    done
+    [ "$count" -gt 0 ]
+}
+
 list_users() {
     local file
     green "\n=== 入站用户 ==="
@@ -1458,16 +1547,14 @@ run_install_flow() {
 
     PORT="$vless_port"
     REALITY_DOMAIN="$reality_domain"
-    if [ "$auto_install" -eq 0 ]; then
-        prompt_reality_settings || exit 1
-    fi
-    generate_reality_values
-    save_state
     if [ "$auto_install" -eq 1 ]; then
         use_default_inbound_profile
     else
+        # 先选协议，再按协议输入具体配置（Reality 端口/SNI 仅在选到 Reality 时提示）
         select_inbound_profile || exit 1
     fi
+    generate_reality_values
+    save_state
     uuid=$(generate_uuid)
     save_selected_user "$default_user_name" "$uuid" "$direct_outbound_tag"
     write_config || exit 1
@@ -1597,8 +1684,15 @@ select_inbound_port() {
 }
 
 select_inbound_profile() {
+    # $1=1 时（初始化）作为 Reality 主入站会提示端口/SNI；add_inbound 传 0 复用现有值
+    local prompt_reality="${1:-1}"
     select_inbound_type || return 1
-    select_inbound_port "$SELECTED_INBOUND_TYPE" || return 1
+    if [ "$SELECTED_INBOUND_TYPE" = "vless-reality" ]; then
+        [ "$prompt_reality" = "1" ] && { prompt_reality_settings || return 1; }
+        SELECTED_INBOUND_PORT="$PORT"
+    else
+        select_inbound_port "$SELECTED_INBOUND_TYPE" || return 1
+    fi
     SELECTED_INBOUND_PASSWORD=""
     SELECTED_INBOUND_METHOD="$default_ss_method"
     SELECTED_INBOUND_SNI=""
@@ -1660,7 +1754,7 @@ add_inbound() {
     require_reality_state || return 1
     list_outbounds
 
-    select_inbound_profile || return 1
+    select_inbound_profile 0 || return 1
 
     reading "请输入入站用户名（英文/数字，仅用于标识本站入站）: " name
     name=$(sanitize_tag "$name")
@@ -1692,35 +1786,159 @@ add_inbound() {
     purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
 }
 
-add_socks_outbound() {
-    local tag display_name server server_port username password
-    require_reality_state || return 1
-    reading "请输入落地 tag（英文/数字）: " tag
-    tag=$(sanitize_tag "$tag")
-    validate_new_outbound_tag "$tag" || return 1
-    reading "请输入显示名称（可留空）: " display_name
-    [ -n "$display_name" ] || display_name="$tag"
-    reading "请输入 SOCKS5 服务器地址: " server
-    [ -n "$server" ] || { red "服务器不能为空"; return 1; }
-    reading "请输入 SOCKS5 端口: " server_port
-    validate_port "$server_port" || { red "端口范围需在 1-65535"; return 1; }
-    reading "请输入 SOCKS5 用户名: " username
-    reading "请输入 SOCKS5 密码: " password
+# 修改某个入站的 outbound 绑定（失败自动还原）
+change_user_outbound() {
+    local name="$1" new_outbound_tag="$2" file old_outbound_tag status sni
+    file=$(user_file "$name")
+    [ -f "$file" ] || { red "入站不存在：$name"; return 1; }
+    outbound_exists "$new_outbound_tag" || { red "落地不存在：$new_outbound_tag"; return 1; }
+    load_user_file "$file"
+    old_outbound_tag="$OUTBOUND_TAG"
+    [ "$old_outbound_tag" = "$new_outbound_tag" ] && { yellow "绑定未变化。"; return 0; }
+    sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
+    save_user "$name" "$UUID" "$new_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
+        save_user "$name" "$UUID" "$old_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    green "已更新绑定：入站 ${name} -> 落地 ${new_outbound_tag}"
+}
 
-    save_socks_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password"
-    create_bound_user_for_outbound "$tag" || return 1
+# 修改入站绑定的落地（列出可选项，输入 tag）
+change_user_outbound_menu() {
+    local name="$1" tag
+    list_outbounds
+    reading "请输入要绑定到的落地 outbound tag（可输入 ${direct_outbound_tag} 或落地 tag）: " tag
+    [ -n "$tag" ] || tag="$direct_outbound_tag"
+    change_user_outbound "$name" "$tag"
+}
+
+# 删除入站（失败自动还原；保留至少一个入站的保护）
+delete_user() {
+    local name="$1" file backup status
+    file=$(user_file "$name")
+    [ -f "$file" ] || { red "入站不存在：$name"; return 1; }
+    has_more_inbound_users "$name" || { red "至少保留一个入站用户。"; return 1; }
+    backup="${file}.bak.$(date +%s)"
+    mv "$file" "$backup"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        mv "$backup" "$file"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -f "$backup"
+    green "已删除入站：$name"
+}
+
+# 修改入站端口；Reality 用户走 change_port（主端口），其余修改各自的 INBOUND_PORT
+change_inbound_port() {
+    local name="$1" file port old_port status sni uuid outbound_tag flow inbound_type password method
+    file=$(user_file "$name")
+    load_user_file "$file"
+    if [ "$INBOUND_TYPE" = "vless-reality" ]; then
+        change_port
+        return
+    fi
+    # inbound_port_in_use 内部会遍历 load_user_file 改写全局，先把当前用户值捕获到局部再调用
+    uuid="$UUID"; outbound_tag="$OUTBOUND_TAG"; flow="$FLOW"
+    inbound_type="$INBOUND_TYPE"; password="$PASSWORD"; method="$METHOD"
+    old_port="$INBOUND_PORT"
+    sni=""; [ "$inbound_type" = "hysteria2" ] && sni="$H2_SNI"
+    reading "请输入新的监听端口（回车随机）: " port
+    [ -n "$port" ] || port=$(random_port)
+    validate_port "$port" || { red "端口范围需在 1-65535"; return 1; }
+    [ "$port" = "$old_port" ] && { yellow "端口未变化。"; return 0; }
+    if inbound_port_in_use "$port" "$name"; then
+        red "端口已被现有入站或转发占用：$port"
+        return 1
+    fi
+    save_user "$name" "$uuid" "$outbound_tag" "$flow" "$inbound_type" "$password" "$method" "$port" "$sni"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        save_user "$name" "$uuid" "$outbound_tag" "$flow" "$inbound_type" "$password" "$method" "$old_port" "$sni"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    allow_port "$port"
+    green "入站端口已更新：$name -> $port"
+}
+
+# 修改入站 SNI；Reality 用户走 change_reality_domain，仅 hy2 支持自定义 SNI
+change_inbound_sni() {
+    local name="$1" file sni old_sni status
+    file=$(user_file "$name")
+    load_user_file "$file"
+    if [ "$INBOUND_TYPE" = "vless-reality" ]; then
+        change_reality_domain
+        return
+    fi
+    if [ "$INBOUND_TYPE" != "hysteria2" ]; then
+        yellow "该入站类型不支持修改 SNI。"
+        return 1
+    fi
+    reading "请输入新的 SNI（回车默认 ${REALITY_DOMAIN}）: " sni
+    [ -n "$sni" ] || sni="$REALITY_DOMAIN"
+    validate_domain "$sni" || { red "SNI 需为包含点的 FQDN，且只能包含字母、数字、点或连字符。"; return 1; }
+    old_sni="${H2_SNI:-$REALITY_DOMAIN}"
+    [ "$sni" = "$old_sni" ] && { yellow "SNI 未变化。"; return 0; }
+    save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$old_sni"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    green "SNI 已更新：$name -> $sni"
+}
+
+# 修改 SS/HY2 入站密码
+change_inbound_password() {
+    local name="$1" file pw old_pw status sni
+    file=$(user_file "$name")
+    load_user_file "$file"
+    if [ "$INBOUND_TYPE" != "shadowsocks" ] && [ "$INBOUND_TYPE" != "hysteria2" ]; then
+        yellow "该入站类型无需密码。"
+        return 1
+    fi
+    reading "请输入新的密码（回车自动生成）: " pw
+    [ -n "$pw" ] || pw=$(generate_password)
+    old_pw="$PASSWORD"
+    sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
+    save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$pw" "$METHOD" "$INBOUND_PORT" "$sni"
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
+        save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$old_pw" "$METHOD" "$INBOUND_PORT" "$sni"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    green "密码已更新：$name"
 }
 
 decode_import_input() {
     local input="$1" decoded
     input=$(trim "$input")
-    if [[ "$input" == ss://* || "$input" == vless://* || "$input" == http://* || "$input" == https://* ]]; then
+    if [[ "$input" == ss://* || "$input" == vless://* || "$input" == http://* || "$input" == https://* || "$input" == socks5://* || "$input" == socks://* ]]; then
         printf '%s' "$input"
         return 0
     fi
     decoded=$(b64_decode "$input") || return 1
     decoded=$(trim "$decoded")
-    if [[ "$decoded" == ss://* || "$decoded" == vless://* || "$decoded" == http://* || "$decoded" == https://* ]]; then
+    if [[ "$decoded" == ss://* || "$decoded" == vless://* || "$decoded" == http://* || "$decoded" == https://* || "$decoded" == socks5://* || "$decoded" == socks://* ]]; then
         printf '%s' "$decoded"
         return 0
     fi
@@ -1872,25 +2090,85 @@ import_http_uri() {
     imported_outbound_tag="$tag"
 }
 
+import_socks_uri() {
+    local uri body fragment main auth hostport username password server server_port tag display_name
+    uri="$PARSED_URI"
+    body="$PARSED_BODY"
+    fragment="$PARSED_FRAGMENT"
+    case "$uri" in
+        socks5://*|socks://*) ;;
+        *) red "导入内容不是 socks5:// 或 socks://"; return 1 ;;
+    esac
+
+    main="$body"
+    username=""
+    password=""
+    if [[ "$main" == *@* ]]; then
+        auth=${main%@*}
+        hostport=${main#*@}
+        if [[ "$auth" == *:* ]]; then
+            username=$(url_decode "${auth%%:*}")
+            password=$(url_decode "${auth#*:}")
+        else
+            username=$(url_decode "$auth")
+        fi
+    else
+        hostport="$main"
+    fi
+
+    IFS='|' read -r server server_port <<< "$(split_hostport "$hostport")"
+
+    [ -n "$server" ] || { red "SOCKS5 落地缺少服务器地址。"; return 1; }
+    validate_port "$server_port" || { red "SOCKS5 落地端口无效。"; return 1; }
+
+    reading "请输入落地 tag（留空使用链接名称）: " tag
+    [ -n "$tag" ] || tag="${fragment:-socks5-$(date +%s)}"
+    tag=$(sanitize_tag "$tag")
+    validate_new_outbound_tag "$tag" || return 1
+    display_name="${fragment:-$tag}"
+    save_socks_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password"
+    imported_outbound_tag="$tag"
+}
+
 import_outbound_from_input() {
     local input
     require_reality_state || return 1
     prepare_import_base
-    reading "请输入落地链接或其 base64（支持 ss/vless/http/https）: " input
+    reading "请输入落地链接或其 base64（支持 ss/vless/http/https/socks5）： " input
     parse_common_uri "$input" || { red "无法解析导入内容。"; return 1; }
 
     case "$PARSED_URI" in
         ss://*) import_shadowsocks_uri ;;
         vless://*) import_vless_uri ;;
         http://*|https://*) import_http_uri ;;
+        socks5://*|socks://*) import_socks_uri ;;
         *) red "不支持的落地协议。"; return 1 ;;
     esac
 }
 
 import_outbound_auto() {
+    local outbound_tag user_name
     require_reality_state || return 1
     import_outbound_from_input || return 1
-    create_bound_user_for_outbound "$imported_outbound_tag" || return 1
+    outbound_tag="$imported_outbound_tag"
+
+    collect_inbound_names
+    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+        yellow "当前没有任何入站，已自动创建绑定该落地的新用户。"
+        create_bound_user_for_outbound "$outbound_tag" || return 1
+        return 0
+    fi
+
+    green "落地 ${outbound_tag} 已添加，请选择要绑定到该落地的入站："
+    list_inbounds_numbered
+    pick_index "${#INBOUND_NAMES[@]}" || { rm -f "$(outbound_file "$outbound_tag")"; return 1; }
+    user_name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
+    if ! change_user_outbound "$user_name" "$outbound_tag"; then
+        rm -f "$(outbound_file "$outbound_tag")"
+        write_config >/dev/null 2>&1 || true
+        return 1
+    fi
+    green "已绑定：入站 ${user_name} -> 落地 ${outbound_tag}"
 }
 
 users_for_outbound() {
@@ -1905,12 +2183,9 @@ users_for_outbound() {
     done
 }
 
-delete_outbound() {
-    local tag file user users backup_dir status item count=0
-    require_reality_state || return 1
-    list_outbounds
-    reading "请输入要删除的落地 tag: " tag
-    tag=$(sanitize_tag "$tag")
+delete_outbound_by_tag() {
+    local tag="$1" file user users backup_dir status item count=0
+    [ -n "$tag" ] || { red "缺少落地 tag。"; return 1; }
     [ "$tag" != "$direct_outbound_tag" ] && [ "$tag" != "$block_outbound_tag" ] || { red "不能删除内置 outbound: $tag"; return 1; }
     file=$(outbound_file "$tag")
     [ -f "$file" ] || { red "outbound 不存在: $tag"; return 1; }
@@ -2278,43 +2553,90 @@ manage_forwards_menu() {
 }
 
 manage_route_menu() {
-    local choice
+    local outbound_tag users sub
     require_reality_state || return 1
     clear_screen
     green "=== 落地管理 ===\n"
-    green "1. 导入落地并自动绑定用户"
-    green "2. 手动添加 SOCKS5 落地并自动绑定用户"
-    green "3. 查看节点链接"
-    green "4. 列出落地"
-    red "5. 删除落地和绑定用户"
-    purple "0. 返回主菜单"
-    reading "请输入选择: " choice
+    collect_outbound_tags
+    if [ "${#OUTBOUND_TAGS[@]}" -eq 0 ]; then
+        yellow "尚未添加任何落地。请在主菜单选择 2 添加落地。"
+        return 1
+    fi
+    list_outbounds_numbered
+    pick_index "${#OUTBOUND_TAGS[@]}" || return 1
+    outbound_tag="${OUTBOUND_TAGS[$((PICKED_INDEX - 1))]}"
 
-    case "$choice" in
-        1) import_outbound_auto ;;
-        2) add_socks_outbound ;;
-        3) show_reality_info ;;
-        4) list_outbounds ;;
-        5) delete_outbound ;;
+    load_outbound_file "$(outbound_file "$outbound_tag")"
+    users=$(users_for_outbound "$outbound_tag")
+    green "\n落地：${outbound_tag} | ${TYPE} | ${DISPLAY_NAME:-$SERVER:$SERVER_PORT}"
+    purple "绑定入站：${users:-无}\n"
+    green "1. 删除该落地"
+    green "2. 修改绑定的入站"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " sub
+
+    case "$sub" in
+        1) delete_outbound_by_tag "$outbound_tag" ;;
+        2) rebind_outbound_inbound "$outbound_tag" ;;
         0) return ;;
         *) red "无效的选项" ;;
     esac
 }
 
-manage_reality_settings_menu() {
-    local choice
+rebind_outbound_inbound() {
+    local outbound_tag="$1" user_name
+    collect_inbound_names
+    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+        yellow "暂无入站可绑定。"
+        return 1
+    fi
+    green "\n请选择要绑定到落地（${outbound_tag}）的入站（该入站的原落地绑定将被覆盖）："
+    list_inbounds_numbered
+    pick_index "${#INBOUND_NAMES[@]}" || return 1
+    user_name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
+    change_user_outbound "$user_name" "$outbound_tag" || return 1
+}
+
+manage_inbound_settings_menu() {
+    local name sub port_n sni_n pass_n out_n del_n
     require_reality_state || return 1
     clear_screen
-    green "=== Reality 设置 ===\n"
-    green "1. 修改 Reality 端口"
-    green "2. 修改 Reality 伪装域名/SNI"
-    purple "0. 返回主菜单"
-    reading "请输入选择: " choice
+    green "=== 入站设置 ===\n"
+    collect_inbound_names
+    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+        yellow "暂无入站。请先选择 1 初始化节点，或 3 增加入站。"
+        return 1
+    fi
+    list_inbounds_numbered
+    pick_index "${#INBOUND_NAMES[@]}" || return 1
+    name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
+    load_user_file "$(user_file "$name")"
+    green "\n${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}\n"
 
-    case "$choice" in
-        1) change_port ;;
-        2) change_reality_domain ;;
+    port_n=1
+    case "$INBOUND_TYPE" in
+        vless-reality) sni_n=2; pass_n=""; out_n=3; del_n=4 ;;
+        vless)       sni_n=""; pass_n=""; out_n=2; del_n=3 ;;
+        shadowsocks) sni_n=""; pass_n=2; out_n=3; del_n=4 ;;
+        hysteria2)   sni_n=2; pass_n=3; out_n=4; del_n=5 ;;
+        *) red "未知入站类型：$INBOUND_TYPE"; return 1 ;;
+    esac
+
+    green "${port_n}. 修改端口"
+    [ -n "$sni_n" ] && green "${sni_n}. 修改 SNI"
+    [ -n "$pass_n" ] && green "${pass_n}. 修改密码"
+    green "${out_n}. 修改绑定的落地"
+    red "${del_n}. 删除该入站"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " sub
+
+    case "$sub" in
         0) return ;;
+        "$port_n") change_inbound_port "$name" ;;
+        "$sni_n") change_inbound_sni "$name" ;;
+        "$pass_n") change_inbound_password "$name" ;;
+        "$out_n") change_user_outbound_menu "$name" ;;
+        "$del_n") delete_user "$name" ;;
         *) red "无效的选项" ;;
     esac
 }
@@ -2393,11 +2715,11 @@ menu() {
     purple "=== sing-box 多协议入站中转/本机节点脚本 ===\n"
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
-    green "2. 添加落地并自动绑定用户"
+    green "2. 添加落地"
     green "3. 增加入站（代理服务器）"
     green "4. 查看节点和落地摘要"
     green "5. 管理落地"
-    green "6. 修改 Reality 设置"
+    green "6. 修改入站设置"
     green "7. TCP/UDP 转发管理"
     green "8. sing-box 服务管理"
     green "9. 查看 sing-box 日志"
@@ -2421,9 +2743,9 @@ while true; do
         1) run_install_flow ;;
         2) import_outbound_auto ;;
         3) add_inbound ;;
-        4) show_reality_info; list_forwards_cli ;;
+        4) show_reality_info; list_outbounds; list_forwards_cli ;;
         5) manage_route_menu ;;
-        6) manage_reality_settings_menu ;;
+        6) manage_inbound_settings_menu ;;
         7) manage_forwards_menu ;;
         8) manage_singbox ;;
         9) show_singbox_logs ;;
