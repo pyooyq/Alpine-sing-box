@@ -28,7 +28,7 @@ outbounds_dir="${work_dir}/outbounds.d"
 forwards_dir="${work_dir}/forwards.d"
 installed_script="${work_dir}/sb.sh"
 reality_domain="cas-bridge.xethub.hf.co"
-vless_port=""
+vless_port=""   # 由 -port 指定；实为 Reality 主入站监听端口（历史命名，非 VLESS 入站端口）
 auto_install=0
 reality_inbound_tag="reality-in"
 vless_inbound_tag="vless-in"
@@ -41,7 +41,6 @@ default_fingerprint="chrome"
 default_inbound_type="vless-reality"
 default_ss_method="aes-128-gcm"
 imported_outbound_tag=""
-imported_outbound_file=""
 
 usage() {
     cat << EOF
@@ -69,6 +68,25 @@ validate_port() {
     [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+validate_host_address() {
+    # 接受 IPv4 / IPv6（带或不带方括号）/ 主机名/域名
+    local addr="$1"
+    [ -n "$addr" ] || return 1
+
+    # 去掉 IPv6 方括号
+    if [[ "$addr" == \[*\] ]]; then
+        addr="${addr#[}"
+        addr="${addr%]}"
+    fi
+
+    # 含冒号 -> 视为 IPv6（格式由 iptables 兜底校验）
+    [[ "$addr" == *:* ]] && return 0
+
+    # 否则应是主机名/域名或 IPv4：仅允许字母/数字/点/连字符/下划线，须以字母数字开头
+    [[ "$addr" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] && return 0
+    return 1
+}
+
 validate_domain() {
     [ -n "$1" ] || return 1
     [[ "$1" == *.* ]] || return 1
@@ -84,6 +102,7 @@ random_port() {
 
     local n
     n=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+    [[ "$n" =~ ^[0-9]+$ ]] || n=$RANDOM
     echo $((20000 + n % 45001))
 }
 
@@ -125,6 +144,25 @@ env_escape() {
 
 write_env_line() {
     printf '%s="%s"\n' "$1" "$(env_escape "$2")"
+}
+
+# 解析 IPv4/IPv6 地址:端口。IPv6 地址需带方括号，如 [::1]:8080
+split_hostport() {
+    local hp="$1" addr port
+    # 去掉 authority 之后的路径（见 import_http_uri：http 链接常带末尾 / 或 /path）
+    hp="${hp%%/*}"
+    if [[ "$hp" == \[*\]* ]]; then
+        # IPv6: [::1]:8080
+        addr=${hp%%\]*}
+        addr="${addr#\[}"
+        port=${hp#*\]}
+        port=${port#:}
+    else
+        # IPv4 或域名: 1.2.3.4:8080
+        addr=${hp%:*}
+        port=${hp##*:}
+    fi
+    printf '%s|%s' "$addr" "$port"
 }
 
 url_decode() {
@@ -285,10 +323,6 @@ forward_service_name() {
     printf 'sing-box-forward-%s' "$(sanitize_tag "$1")"
 }
 
-forward_file() {
-    printf '%s/%s.env' "$forwards_dir" "$(sanitize_tag "$1")"
-}
-
 has_users() {
     local file
     for file in "$users_dir"/*.env; do
@@ -329,7 +363,6 @@ validate_new_outbound_tag() {
 
 prepare_import_base() {
     imported_outbound_tag=""
-    imported_outbound_file=""
 }
 load_user_file() {
     local file="$1"
@@ -338,6 +371,8 @@ load_user_file() {
         "$users_dir"/*.env) ;;
         *) return 1 ;;
     esac
+    # 保证 Reality 用户端口解析前 PORT 已加载（避免在 load_state 之前调用时的空端口）
+    [ -n "$PORT" ] || load_state
     unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD
     NAME=$(read_env_value "$file" NAME || true)
     UUID=$(read_env_value "$file" UUID || true)
@@ -353,7 +388,9 @@ load_user_file() {
     if [ "$INBOUND_TYPE" = "vless-reality" ]; then
         INBOUND_PORT="$PORT"
     else
-        INBOUND_PORT="${INBOUND_PORT:-$PORT}"
+        # 非 Reality 用户必须显式指定端口：缺省时不再回退到主端口，避免与主端口绑定冲突，
+        # 渲染时会被 validate_port 跳过而非静默抢占主端口。
+        INBOUND_PORT="${INBOUND_PORT:-}"
     fi
     METHOD="${METHOD:-$default_ss_method}"
 }
@@ -951,12 +988,14 @@ render_route_rules_json() {
         printf '      }'
     done
 
-    [ "$first" -eq 1 ] || printf ',\n'
-    printf '      {\n'
-    [ -n "$fallback_inbounds" ] && printf '        "inbound": [%s],\n' "$fallback_inbounds"
-    printf '        "action": "route",\n'
-    printf '        "outbound": %s\n' "$(json_string "$block_outbound_tag")"
-    printf '      }'
+    if [ -n "$fallback_inbounds" ]; then
+        [ "$first" -eq 1 ] || printf ',\n'
+        printf '      {\n'
+        printf '        "inbound": [%s],\n' "$fallback_inbounds"
+        printf '        "action": "route",\n'
+        printf '        "outbound": %s\n' "$(json_string "$block_outbound_tag")"
+        printf '      }'
+    fi
 }
 
 write_config() {
@@ -1030,19 +1069,15 @@ apply_config_or_restore() {
 }
 
 allow_port() {
-    local port="$1"
+    local port="$1" protocol="${2:-tcp}" proto_flag
 
-    yellow "尝试放行 TCP ${port} 端口..."
-    command_exists ufw && ufw allow "${port}/tcp" >/dev/null 2>&1 || true
-    command_exists firewall-cmd && firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
-
-    if command_exists iptables; then
-        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-    fi
-
-    if command_exists ip6tables; then
-        ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-    fi
+    yellow "尝试放行端口 ${port}（${protocol}）..."
+    for proto_flag in $protocol; do
+        command_exists ufw && ufw allow "${port}/${proto_flag}" >/dev/null 2>&1 || true
+        command_exists firewall-cmd && firewall-cmd --permanent --add-port="${port}/${proto_flag}" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
+        command_exists iptables && iptables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || true
+        command_exists ip6tables && ip6tables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || true
+    done
 }
 
 write_systemd_service() {
@@ -1203,7 +1238,9 @@ list_users() {
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
-        [ -n "$NAME" ] && [ -n "$UUID" ] || continue
+        [ -n "$NAME" ] || continue
+        [ "$INBOUND_TYPE" = "shadowsocks" ] && [ -z "$PASSWORD" ] && continue
+        [ "$INBOUND_TYPE" != "shadowsocks" ] && [ -z "$UUID" ] && continue
         purple "${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}"
     done
 }
@@ -1316,6 +1353,8 @@ run_install_flow() {
         yellow "sing-box 已安装。"
         migrate_legacy_state
         write_config || return 1
+        allow_port "$PORT"
+        install_service
         install_logrotate
         show_reality_info
         create_shortcut
@@ -1351,7 +1390,7 @@ change_port() {
     load_state
     [ -n "${PORT:-}" ] || { yellow "尚未安装。"; return 1; }
 
-    local new_port old_port status
+    local new_port old_port status file
     old_port="$PORT"
     reading "请输入新的 Reality 端口（回车随机）: " new_port
     [ -n "$new_port" ] || new_port=$(random_port)
@@ -1366,6 +1405,13 @@ change_port() {
         red "端口已被普通 VLESS/SS 入站占用: $new_port"
         return 1
     fi
+
+    # 避免与 TCP/UDP 转发规则的本地监听端口冲突（与 add_forward 的检查对称）
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_forward_file "$file" || continue
+        [ "$LOCAL_PORT" = "$new_port" ] && { red "端口 ${new_port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
+    done
 
     PORT="$new_port"
     save_state
@@ -1566,17 +1612,14 @@ import_shadowsocks_uri() {
         decoded=$(b64_decode "$userinfo" || printf '%s' "$userinfo")
         method=${decoded%%:*}
         password=${decoded#*:}
-        server=${hostport%:*}
-        server_port=${hostport##*:}
     else
         decoded=$(b64_decode "$main") || { red "SS 主体 base64 解析失败。"; return 1; }
         method=${decoded%%:*}
         decoded=${decoded#*:}
         password=${decoded%@*}
         hostport=${decoded#*@}
-        server=${hostport%:*}
-        server_port=${hostport##*:}
     fi
+    IFS='|' read -r server server_port <<< "$(split_hostport "$hostport")"
 
     validate_port "$server_port" || { red "SS 端口无效。"; return 1; }
     [ -n "$method" ] && [ -n "$password" ] && [ -n "$server" ] || { red "SS 链接缺少 method、password 或 server。"; return 1; }
@@ -1594,7 +1637,6 @@ import_shadowsocks_uri() {
     display_name="${fragment:-$tag}"
     save_shadowsocks_outbound "$tag" "$display_name" "$server" "$server_port" "$method" "$password" "$plugin" "$plugin_opts"
     imported_outbound_tag="$tag"
-    imported_outbound_file=$(outbound_file "$tag")
 }
 
 import_vless_uri() {
@@ -1608,8 +1650,7 @@ import_vless_uri() {
     main="$body"
     outbound_uuid=${main%@*}
     hostport=${main#*@}
-    server=${hostport%:*}
-    server_port=${hostport##*:}
+    IFS='|' read -r server server_port <<< "$(split_hostport "$hostport")"
     [ -n "$outbound_uuid" ] && [ -n "$server" ] || { red "VLESS 链接缺少 UUID 或服务器地址。"; return 1; }
     validate_port "$server_port" || { red "VLESS 端口无效。"; return 1; }
 
@@ -1642,7 +1683,6 @@ import_vless_uri() {
     display_name="${fragment:-$tag}"
     save_vless_outbound "$tag" "$display_name" "$server" "$server_port" "$outbound_uuid" "$flow" "$network" "$tls_enabled" "$tls_server_name" "$tls_insecure" "$utls_fingerprint"
     imported_outbound_tag="$tag"
-    imported_outbound_file=$(outbound_file "$tag")
 }
 
 import_http_uri() {
@@ -1670,8 +1710,8 @@ import_http_uri() {
         hostport="$main"
     fi
 
-    server=${hostport%:*}
-    server_port=${hostport##*:}
+    IFS='|' read -r server server_port <<< "$(split_hostport "$hostport")"
+
     [ -n "$server" ] || { red "HTTP 落地缺少服务器地址。"; return 1; }
     validate_port "$server_port" || { red "HTTP 落地端口无效。"; return 1; }
 
@@ -1682,7 +1722,6 @@ import_http_uri() {
     display_name="${fragment:-$tag}"
     save_http_outbound "$tag" "$display_name" "$server" "$server_port" "$username" "$password" "$tls_enabled"
     imported_outbound_tag="$tag"
-    imported_outbound_file=$(outbound_file "$tag")
 }
 
 import_outbound_from_input() {
@@ -1830,6 +1869,13 @@ forward_iptables_rules() {
             iptables -t nat -A PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}"
         iptables -t nat -C POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null ||
             iptables -t nat -A POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE
+        # 被 DNAT 的包走 FORWARD 链（而非 INPUT/OUTPUT）。若 FORWARD 默认策略是 DROP，
+        # 需显式放行到目标的出向包与来自目标的回向包，否则转发会被丢弃。
+        iptables -C FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT
+        # 回程包来源端口可能不是 target_port（如 UDP 临时端口），按目标地址用 conntrack 放行已建立/相关连接
+        iptables -C FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     done
 }
 
@@ -1839,6 +1885,8 @@ remove_forward_iptables_rules() {
     for proto_flag in $protocol; do
         iptables -t nat -D PREROUTING -p "$proto_flag" --dport "$local_port" -j DNAT --to-destination "${target_addr}:${target_port}" 2>/dev/null || true
         iptables -t nat -D POSTROUTING -d "$target_addr" -p "$proto_flag" --dport "$target_port" -j MASQUERADE 2>/dev/null || true
+        iptables -D FORWARD -p "$proto_flag" -d "$target_addr" --dport "$target_port" -j ACCEPT 2>/dev/null || true
+        iptables -D FORWARD -p "$proto_flag" -s "$target_addr" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     done
 }
 
@@ -1855,7 +1903,8 @@ pidfile="/var/run/${service_name}.pid"
 command_background=false
 
 depend() {
-    need net iptables
+    # 不依赖 iptables 服务：部分系统未安装/未启用 iptables OpenRC 服务会阻塞启动
+    need net
 }
 
 start() {
@@ -1869,6 +1918,10 @@ EOF
         iptables -t nat -A PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port}
     iptables -t nat -C POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null ||
         iptables -t nat -A POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE
+    iptables -C FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null ||
+        iptables -A FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT
+    iptables -C FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+        iptables -A FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 EOF
     done
     cat >> "/etc/init.d/${service_name}" << EOF
@@ -1882,6 +1935,8 @@ EOF
         cat >> "/etc/init.d/${service_name}" << EOF
     iptables -t nat -D PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null || true
     iptables -t nat -D POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 EOF
     done
     cat >> "/etc/init.d/${service_name}" << EOF
@@ -1897,7 +1952,12 @@ EOF
 EOF
     done
     cat >> "/etc/init.d/${service_name}" << EOF
-    [ "\$found" -eq 1 ] && ebegin "forward ${tag} is active" && eend 0 || eerror "forward ${tag} is not active"
+    if [ "\$found" -eq 1 ]; then
+        ebegin "forward ${tag} is active" && eend 0
+    else
+        eerror "forward ${tag} is not active"
+        return 1
+    fi
 }
 EOF
     chmod +x "/etc/init.d/${service_name}"
@@ -1906,9 +1966,90 @@ EOF
 install_forward_service() {
     local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name
     service_name=$(forward_service_name "$tag")
-    write_forward_openrc_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
-    rc-update add "$service_name" default >/dev/null 2>&1
-    rc-service "$service_name" start
+    if command_exists rc-service && command_exists rc-update; then
+        write_forward_openrc_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+        rc-update add "$service_name" default >/dev/null 2>&1
+        rc-service "$service_name" start
+    elif command_exists systemctl; then
+        write_forward_systemd_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+    else
+        yellow "未检测到 OpenRC 或 systemd，无法设置转发服务开机自启；iptables 规则已生效，重启后需手动重加。"
+    fi
+}
+
+write_forward_systemd_service() {
+    local tag="$1" protocol="$2" local_port="$3" target_addr="$4" target_port="$5" service_name wrapper service_file
+    service_name=$(forward_service_name "$tag")
+    wrapper="${work_dir}/${service_name}.sh"
+    service_file="/etc/systemd/system/${service_name}.service"
+    {
+        cat << EOF
+#!/bin/sh
+# sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})
+case "\$1" in
+  start)
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+    sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+EOF
+        for proto_flag in $protocol; do
+            cat << EOF
+    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null ||
+        iptables -t nat -A PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port}
+    iptables -t nat -C POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null ||
+        iptables -t nat -A POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE
+    iptables -C FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null ||
+        iptables -A FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT
+    iptables -C FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
+        iptables -A FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+EOF
+        done
+        cat << EOF
+    ;;
+  stop)
+EOF
+        for proto_flag in $protocol; do
+            cat << EOF
+    iptables -t nat -D PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null || true
+    iptables -t nat -D POSTROUTING -d ${target_addr} -p ${proto_flag} --dport ${target_port} -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -p ${proto_flag} -d ${target_addr} --dport ${target_port} -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p ${proto_flag} -s ${target_addr} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+EOF
+        done
+        cat << EOF
+    ;;
+  status)
+    found=0
+EOF
+        for proto_flag in $protocol; do
+            cat << EOF
+    iptables -t nat -C PREROUTING -p ${proto_flag} --dport ${local_port} -j DNAT --to-destination ${target_addr}:${target_port} 2>/dev/null && found=1
+EOF
+        done
+        cat << EOF
+    [ "\$found" -eq 1 ] && echo "forward ${tag} is active" && exit 0 || { echo "forward ${tag} is not active" >&2; exit 1; }
+    ;;
+  *) echo "usage: \$0 {start|stop|status}" >&2; exit 1 ;;
+esac
+EOF
+    } > "$wrapper"
+    chmod +x "$wrapper"
+
+    cat > "$service_file" << EOF
+[Unit]
+Description=sing-box TCP/UDP forward: :${local_port} -> ${target_addr}:${target_port} (${protocol})
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${wrapper} start
+ExecStop=${wrapper} stop
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now "${service_name}.service"
 }
 
 uninstall_forward_service() {
@@ -1919,10 +2060,17 @@ uninstall_forward_service() {
         rc-update del "$service_name" default 2>/dev/null || true
         rm -f "/etc/init.d/${service_name}"
     fi
+    if [ -f "/etc/systemd/system/${service_name}.service" ]; then
+        systemctl disable --now "${service_name}.service" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${service_name}.service"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    rm -f "${work_dir}/${service_name}.sh"
 }
 
 add_forward() {
     local tag protocol local_port target_addr target_port
+    load_state
 
     reading "请输入转发规则名称（英文/数字）: " tag
     tag=$(sanitize_tag "$tag")
@@ -1941,7 +2089,9 @@ add_forward() {
     validate_port "$local_port" || { red "端口范围需在 1-65535"; return 1; }
 
     reading "请输入目标地址 (IP 或域名): " target_addr
-    [ -n "$target_addr" ] || { red "目标地址不能为空"; return 1; }
+    validate_host_address "$target_addr" || { red "目标地址无效。"; return 1; }
+    # 转发走 iptables（IPv4 DNAT），暂不支持 IPv6 目标地址
+    [[ "$target_addr" == *:* ]] && { red "当前仅支持 IPv4/域名目标地址，不支持 IPv6。"; return 1; }
 
     reading "请输入目标端口: " target_port
     validate_port "$target_port" || { red "端口范围需在 1-65535"; return 1; }
@@ -1954,6 +2104,12 @@ add_forward() {
         [ "$LOCAL_PORT" = "$local_port" ] && { red "本地端口 ${local_port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
     done
 
+    # 检查本地端口是否与 sing-box 入站端口冲突（Reality 主端口或非 Reality 入站端口）
+    if inbound_port_in_use "$local_port"; then
+        red "本地端口 ${local_port} 已被 sing-box 入站占用，请换一个端口或先调整入站配置。"
+        return 1
+    fi
+
     save_forward "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
 
     # 启用 IP 转发
@@ -1961,6 +2117,7 @@ add_forward() {
     sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
 
     forward_iptables_rules "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
+    allow_port "$local_port" "$protocol"
     install_forward_service "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
 
     green "转发规则已添加: ${tag} | ${protocol} | :${local_port} -> ${target_addr}:${target_port}"
@@ -1979,6 +2136,8 @@ delete_forward() {
 
     load_forward_file "$file"
     uninstall_forward_service "$tag"
+    # 兜底：即使 OpenRC 服务缺失，也直接删除 iptables 规则，避免残留
+    remove_forward_iptables_rules "$TAG" "$PROTOCOL" "$LOCAL_PORT" "$TARGET_ADDR" "$TARGET_PORT"
     rm -f "$file"
     green "转发规则已删除: $tag"
 }
@@ -2076,11 +2235,13 @@ uninstall_singbox() {
         y|Y)
             yellow "正在卸载 sing-box..."
 
-            # 清理所有转发规则
+            # 清理所有转发规则（iptables 规则 + OpenRC 服务）
             for file in "$forwards_dir"/*.env; do
                 [ -f "$file" ] || continue
                 load_forward_file "$file" || continue
-                [ -n "$TAG" ] && uninstall_forward_service "$TAG" || true
+                [ -n "$TAG" ] || continue
+                remove_forward_iptables_rules "$TAG" "$PROTOCOL" "$LOCAL_PORT" "$TARGET_ADDR" "$TARGET_PORT"
+                uninstall_forward_service "$TAG"
             done
 
             # 清理服务
@@ -2110,6 +2271,8 @@ ensure_shortcut() {
     [ "${SB_SHORTCUT_INSTALLING:-0}" = "1" ] && return 0
     [ "${EUID:-$(id -u)}" -eq 0 ] || return 0
     [ -f "$installed_script" ] && [ -x /usr/bin/sb ] && return 0
+    # 仅在已安装（存在运行状态与配置）时才创建快捷命令，避免仅查看菜单就改写系统
+    [ -f "$state_file" ] && [ -f "$config_dir" ] || return 0
     create_shortcut
 }
 
