@@ -360,8 +360,8 @@ outbound_exists() {
 }
 
 inbound_port_in_use() {
-    local port="$1" skip_user="${2:-}" file
-    # 仅当确实存在 Reality 入站时，主端口 PORT 才视为已占用（初始化选非 Reality 协议时 PORT 仅为占位值）
+    local port="$1" type="$2" skip_user="${3:-}" file
+    # 主端口仅当存在 Reality 入站时视为占用（初始化选非 Reality 协议时 PORT 仅为占位值）
     if has_inbound_type "vless-reality" && [ "$port" = "$PORT" ]; then
         return 0
     fi
@@ -370,7 +370,10 @@ inbound_port_in_use() {
         load_user_file "$file"
         [ "$NAME" = "$skip_user" ] && continue
         [ "$INBOUND_TYPE" = "vless-reality" ] && continue
-        [ "$INBOUND_PORT" = "$port" ] && return 0
+        [ "$INBOUND_PORT" = "$port" ] || continue
+        # 同协议同端口视为加入同一入站（共享）；仅 SS（暂未支持一端口多用户）与其他协议占用视为冲突
+        [ "$INBOUND_TYPE" = "$type" ] && [ "$type" != "shadowsocks" ] && continue
+        return 0
     done
     return 1
 }
@@ -806,14 +809,122 @@ render_vless_reality_users_json() {
     done
 }
 
-inbound_tag_for_user() {
-    local name="$1" inbound_type="$2"
-    case "$inbound_type" in
-        vless) printf '%s-%s' "$vless_inbound_tag" "$name" ;;
-        shadowsocks) printf '%s-%s' "$ss_inbound_tag" "$name" ;;
-        hysteria2) printf '%s-%s' "$hy2_inbound_tag" "$name" ;;
+inbound_tag_for_group() {
+    local type="$1" port="$2"
+    case "$type" in
+        vless) printf '%s-%s' "$vless_inbound_tag" "$port" ;;
+        shadowsocks) printf '%s-%s' "$ss_inbound_tag" "$port" ;;
+        hysteria2) printf '%s-%s' "$hy2_inbound_tag" "$port" ;;
         *) printf '%s' "$reality_inbound_tag" ;;
     esac
+}
+
+# 收集所有可见入站到全局数组 INBOUND_GROUPS，每项 "type|port"（Reality 归一为 PORT）
+collect_inbound_groups() {
+    local file type port key already existing
+    INBOUND_GROUPS=()
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        type="$INBOUND_TYPE"
+        if [ "$type" = "vless-reality" ]; then
+            port="$PORT"
+        else
+            port="$INBOUND_PORT"
+            validate_port "$port" || continue
+        fi
+        key="${type}|${port}"
+        already=0
+        for existing in "${INBOUND_GROUPS[@]}"; do
+            [ "$existing" = "$key" ] && { already=1; break; }
+        done
+        [ "$already" -eq 0 ] && INBOUND_GROUPS+=("$key")
+    done
+}
+
+# 读取组内（type,port）某字段值（取首个成员），缺省回退 default
+group_member_field() {
+    local type="$1" port="$2" field="$3" default="$4" file
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        [ "$INBOUND_TYPE" = "$type" ] || continue
+        if [ "$type" = "vless-reality" ]; then
+            [ "$INBOUND_PORT" = "$PORT" ] || continue
+        else
+            [ "$INBOUND_PORT" = "$port" ] || continue
+        fi
+        case "$field" in
+            METHOD) printf '%s' "${METHOD:-$default}" ;;
+            PASSWORD) printf '%s' "${PASSWORD:-$default}" ;;
+            H2_SNI) printf '%s' "${H2_SNI:-$default}" ;;
+        esac
+        return 0
+    done
+    printf '%s' "$default"
+}
+
+# 组内成员名（空格分隔），供遍历/展示
+group_member_names() {
+    local type="$1" port="$2" file first=1
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        [ "$INBOUND_TYPE" = "$type" ] || continue
+        if [ "$type" = "vless-reality" ]; then
+            [ "$INBOUND_PORT" = "$PORT" ] || continue
+        else
+            [ "$INBOUND_PORT" = "$port" ] || continue
+        fi
+        [ "$first" -eq 1 ] || printf ' '
+        first=0
+        printf '%s' "$NAME"
+    done
+}
+
+group_label() {
+    case "$1" in
+        vless-reality) printf 'VLESS+Reality :%s' "$2" ;;
+        vless) printf 'VLESS :%s' "$2" ;;
+        shadowsocks) printf 'SS :%s' "$2" ;;
+        hysteria2) printf 'HY2 :%s' "$2" ;;
+        *) printf '%s :%s' "$1" "$2" ;;
+    esac
+}
+
+# 渲染组内所有成员的 users 数组条目（含逗号）；kind = vless|shadowsocks|hysteria2
+render_group_users_json() {
+    local type="$1" port="$2" kind="$3" file first=1
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        [ "$INBOUND_TYPE" = "$type" ] || continue
+        if [ "$type" = "vless-reality" ]; then
+            [ "$INBOUND_PORT" = "$PORT" ] || continue
+        else
+            [ "$INBOUND_PORT" = "$port" ] || continue
+        fi
+        [ "$first" -eq 1 ] || printf ',\n'
+        first=0
+        case "$kind" in
+            vless)
+                printf '        {\n'
+                printf '          "name": %s,\n' "$(json_string "$NAME")"
+                printf '          "uuid": %s\n' "$(json_string "$UUID")"
+                printf '        }'
+                ;;
+            shadowsocks|hysteria2)
+                printf '        {\n'
+                printf '          "name": %s,\n' "$(json_string "$NAME")"
+                printf '          "password": %s\n' "$(json_string "$PASSWORD")"
+                printf '        }'
+                ;;
+        esac
+    done
 }
 
 has_inbound_type() {
@@ -838,11 +949,16 @@ has_inbound_type() {
 }
 
 render_inbounds_json() {
-    local file first=1 name uuid inbound_type inbound_port inbound_tag password method sni
-    if has_inbound_type "vless-reality"; then
+    local g type port tag owner_method owner_password owner_sni first=1
+    collect_inbound_groups
+    for g in "${INBOUND_GROUPS[@]}"; do
+        type="${g%%|*}"
+        port="${g##*|}"
         [ "$first" -eq 1 ] || printf ',\n'
         first=0
-        cat << EOF
+        case "$type" in
+            vless-reality)
+                cat << EOF
     {
       "type": "vless",
       "tag": "${reality_inbound_tag}",
@@ -868,74 +984,52 @@ $(render_vless_reality_users_json)
       }
     }
 EOF
-    fi
-
-    for file in "$users_dir"/*.env; do
-        [ -f "$file" ] || continue
-        load_user_file "$file"
-        name="$NAME"
-        uuid="$UUID"
-        inbound_type="$INBOUND_TYPE"
-        inbound_port="$INBOUND_PORT"
-        inbound_tag=$(inbound_tag_for_user "$name" "$inbound_type")
-        case "$inbound_type" in
+                ;;
             vless)
-                [ -n "$name" ] && [ -n "$uuid" ] && validate_port "$inbound_port" || continue
-                [ "$first" -eq 1 ] || printf ',\n'
-                first=0
+                tag=$(inbound_tag_for_group "$type" "$port")
                 cat << EOF
     {
       "type": "vless",
-      "tag": "${inbound_tag}",
+      "tag": "${tag}",
       "listen": "::",
-      "listen_port": ${inbound_port},
+      "listen_port": ${port},
       "users": [
-        {
-          "name": $(json_string "$name"),
-          "uuid": $(json_string "$uuid")
-        }
+$(render_group_users_json "$type" "$port" vless)
       ]
     }
 EOF
                 ;;
             shadowsocks)
-                password="$PASSWORD"
-                method="${METHOD:-$default_ss_method}"
-                [ -n "$name" ] && [ -n "$password" ] && validate_port "$inbound_port" || continue
-                [ "$first" -eq 1 ] || printf ',\n'
-                first=0
+                tag=$(inbound_tag_for_group "$type" "$port")
+                owner_method=$(group_member_field "$type" "$port" METHOD "$default_ss_method")
+                owner_password=$(group_member_field "$type" "$port" PASSWORD "")
+                # SS 暂不支持一端口多用户（需 2022 加密），此处按单用户渲染，仅 method+password
                 cat << EOF
     {
       "type": "shadowsocks",
-      "tag": "${inbound_tag}",
+      "tag": "${tag}",
       "listen": "::",
-      "listen_port": ${inbound_port},
-      "method": $(json_string "$method"),
-      "password": $(json_string "$password")
+      "listen_port": ${port},
+      "method": $(json_string "$owner_method"),
+      "password": $(json_string "$owner_password")
     }
 EOF
                 ;;
             hysteria2)
-                password="$PASSWORD"
-                sni="${H2_SNI:-$REALITY_DOMAIN}"
-                [ -n "$name" ] && [ -n "$password" ] && validate_port "$inbound_port" || continue
-                [ "$first" -eq 1 ] || printf ',\n'
-                first=0
+                tag=$(inbound_tag_for_group "$type" "$port")
+                owner_sni=$(group_member_field "$type" "$port" H2_SNI "$REALITY_DOMAIN")
                 cat << EOF
     {
       "type": "hysteria2",
-      "tag": "${inbound_tag}",
+      "tag": "${tag}",
       "listen": "::",
-      "listen_port": ${inbound_port},
+      "listen_port": ${port},
       "users": [
-        {
-          "name": $(json_string "$name"),
-          "password": $(json_string "$password")
-        }
+$(render_group_users_json "$type" "$port" hysteria2)
       ],
       "tls": {
         "enabled": true,
-        "server_name": $(json_string "$sni"),
+        "server_name": $(json_string "$owner_sni"),
         "key_path": "$(json_escape "$hy2_key")",
         "certificate_path": "$(json_escape "$hy2_cert")"
       }
@@ -1031,15 +1125,22 @@ render_outbound_json() {
 }
 
 render_route_rules_json() {
-    local file first=1 name outbound_tag inbound_tag inbound_type fallback_inbounds="" fallback_seen=""
+    local file first=1 name outbound_tag inbound_type inbound_port inbound_tag
+    local fallback_inbounds="" fallback_seen=""
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
         load_user_file "$file"
+        user_is_visible || continue
         name="$NAME"
         outbound_tag="$OUTBOUND_TAG"
         inbound_type="$INBOUND_TYPE"
-        inbound_tag=$(inbound_tag_for_user "$name" "$inbound_type")
-        [ -n "$name" ] || continue
+        if [ "$inbound_type" = "vless-reality" ]; then
+            inbound_port="$PORT"
+        else
+            inbound_port="$INBOUND_PORT"
+            validate_port "$inbound_port" || continue
+        fi
+        inbound_tag=$(inbound_tag_for_group "$inbound_type" "$inbound_port")
         case "|$fallback_seen|" in
             *"|$inbound_tag|"*) ;;
             *)
@@ -1055,9 +1156,8 @@ render_route_rules_json() {
         first=0
         printf '      {\n'
         printf '        "inbound": [%s],\n' "$(json_string "$inbound_tag")"
-        if [ "$inbound_type" = "vless-reality" ]; then
-            printf '        "auth_user": [%s],\n' "$(json_string "$name")"
-        fi
+        # SS 现为单用户（无 users 数组/命名用户），连接无 auth_user，故不带该匹配
+        [ "$inbound_type" != "shadowsocks" ] && printf '        "auth_user": [%s],\n' "$(json_string "$name")"
         printf '        "action": "route",\n'
         printf '        "outbound": %s\n' "$(json_string "$outbound_tag")"
         printf '      }'
@@ -1169,8 +1269,8 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=${work_dir}/${server_name} run -c ${config_dir}
 ExecReload=/bin/kill -HUP \$MAINPID
-Restart=on-failure
-RestartSec=10
+Restart=always
+RestartSec=5
 LimitNOFILE=infinity
 
 [Install]
@@ -1182,7 +1282,21 @@ EOF
 }
 
 write_openrc_service() {
-    cat > /etc/init.d/sing-box << EOF
+    # 启用 OpenRC 内建 supervise-daemon 实现"被杀自动重启、手动停止不复活"
+    if command_exists supervise-daemon; then
+        cat > /etc/init.d/sing-box << EOF
+#!/sbin/openrc-run
+
+supervisor="supervise-daemon"
+description="sing-box service"
+command="${work_dir}/${server_name}"
+command_args="run -c ${config_dir}"
+command_background=true
+pidfile="/var/run/sing-box.pid"
+respawn_delay=5
+EOF
+    else
+        cat > /etc/init.d/sing-box << EOF
 #!/sbin/openrc-run
 
 description="sing-box service"
@@ -1191,6 +1305,8 @@ command_args="run -c ${config_dir}"
 command_background=true
 pidfile="/var/run/sing-box.pid"
 EOF
+        yellow "本机 OpenRC 无 supervise-daemon，sing-box 守护降级为不自动重启。"
+    fi
 
     chmod +x /etc/init.d/sing-box
     rc-update add sing-box default >/dev/null 2>&1
@@ -1670,7 +1786,7 @@ select_inbound_port() {
     reading "请输入入站监听端口（留空随机）: " port
     [ -n "$port" ] || port=$(random_port)
     validate_port "$port" || { red "端口范围需在 1-65535"; return 1; }
-    if inbound_port_in_use "$port"; then
+    if inbound_port_in_use "$port" "$inbound_type"; then
         red "端口已被现有入站占用: $port"
         return 1
     fi
@@ -1679,6 +1795,15 @@ select_inbound_port() {
         [ -f "$file" ] || continue
         load_forward_file "$file" || continue
         [ "$LOCAL_PORT" = "$port" ] && { red "端口 ${port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
+    done
+    # 已有同协议同端口入站 -> 新用户将加入该入站（共享）
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        [ "$INBOUND_TYPE" = "$inbound_type" ] || continue
+        [ "$INBOUND_PORT" = "$port" ] || continue
+        yellow "端口 ${port} 已有 ${inbound_type} 入站，新用户将加入其中（不新建端口）。"
+        break
     done
     SELECTED_INBOUND_PORT="$port"
 }
@@ -1750,11 +1875,24 @@ create_bound_user_for_outbound() {
 }
 
 add_inbound() {
-    local name uuid outbound_tag status
+    local name uuid outbound_tag status join=0 file
     require_reality_state || return 1
     list_outbounds
 
     select_inbound_profile 0 || return 1
+
+    # 加入已有同协议同端口组（SS 暂不支持一端口多用户）；hy2 组级 SNI 继承
+    if [ "$SELECTED_INBOUND_TYPE" != "vless-reality" ] && [ "$SELECTED_INBOUND_TYPE" != "shadowsocks" ]; then
+        for file in "$users_dir"/*.env; do
+            [ -f "$file" ] || continue
+            load_user_file "$file"
+            [ "$INBOUND_TYPE" = "$SELECTED_INBOUND_TYPE" ] || continue
+            [ "$INBOUND_PORT" = "$SELECTED_INBOUND_PORT" ] || continue
+            join=1
+            [ "$SELECTED_INBOUND_TYPE" = "hysteria2" ] && SELECTED_INBOUND_SNI="$H2_SNI"
+            break
+        done
+    fi
 
     reading "请输入入站用户名（英文/数字，仅用于标识本站入站）: " name
     name=$(sanitize_tag "$name")
@@ -1782,8 +1920,52 @@ add_inbound() {
     fi
 
     allow_port "$SELECTED_INBOUND_PORT"
-    green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
+    if [ "$join" -eq 1 ]; then
+        green "已加入入站：${name} -> ${outbound_tag} (${SELECTED_INBOUND_TYPE}, port=${SELECTED_INBOUND_PORT})"
+    else
+        green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
+    fi
     purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
+}
+
+# 把已导入的落地绑定为指定入站分组上的【新用户】（自动生成凭据，不覆盖现有用户）
+bind_landing_to_group() {
+    local outbound_tag="$1" type="$2" port="$3" name uuid pw sni status
+    name=$(sanitize_tag "$outbound_tag")
+    if user_exists "$name"; then
+        name="${name}-$(date +%s)"
+    fi
+    case "$type" in
+        vless-reality)
+            uuid=$(generate_uuid)
+            save_user "$name" "$uuid" "$outbound_tag" "$default_flow" "$type" "" "" "$port" ""
+            ;;
+        vless)
+            uuid=$(generate_uuid)
+            save_user "$name" "$uuid" "$outbound_tag" "" "$type" "" "" "$port" ""
+            ;;
+        hysteria2)
+            sni=$(group_member_field "$type" "$port" H2_SNI "$REALITY_DOMAIN")
+            ensure_hy2_cert "$sni" || return 1
+            pw=$(generate_password)
+            save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "$sni"
+            ;;
+        *)
+            red "不支持的入站类型：$type"
+            return 1
+            ;;
+    esac
+
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$(user_file "$name")"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    allow_port "$port"
+    green "已绑定落地：用户 ${name} -> ${outbound_tag} (${type}, port=${port})"
 }
 
 # 修改某个入站的 outbound 绑定（失败自动还原）
@@ -1835,72 +2017,103 @@ delete_user() {
         return 1
     fi
     rm -f "$backup"
-    green "已删除入站：$name"
+    green "已删除用户：$name"
 }
 
-# 修改入站端口；Reality 用户走 change_port（主端口），其余修改各自的 INBOUND_PORT
-change_inbound_port() {
-    local name="$1" file port old_port status sni uuid outbound_tag flow inbound_type password method
-    file=$(user_file "$name")
-    load_user_file "$file"
-    if [ "$INBOUND_TYPE" = "vless-reality" ]; then
+# 修改入站端口（组级：同协议同端口整组迁移）；Reality 走 change_port（主端口）
+change_inbound_port_group() {
+    local type="$1" old_port="$2" new_port status members name backup_dir f u o fl i pw m sn
+    if [ "$type" = "vless-reality" ]; then
         change_port
         return
     fi
-    # inbound_port_in_use 内部会遍历 load_user_file 改写全局，先把当前用户值捕获到局部再调用
-    uuid="$UUID"; outbound_tag="$OUTBOUND_TAG"; flow="$FLOW"
-    inbound_type="$INBOUND_TYPE"; password="$PASSWORD"; method="$METHOD"
-    old_port="$INBOUND_PORT"
-    sni=""; [ "$inbound_type" = "hysteria2" ] && sni="$H2_SNI"
-    reading "请输入新的监听端口（回车随机）: " port
-    [ -n "$port" ] || port=$(random_port)
-    validate_port "$port" || { red "端口范围需在 1-65535"; return 1; }
-    [ "$port" = "$old_port" ] && { yellow "端口未变化。"; return 0; }
-    if inbound_port_in_use "$port" "$name"; then
-        red "端口已被现有入站或转发占用：$port"
+    members=$(group_member_names "$type" "$old_port")
+    [ -n "$members" ] || { red "入站不存在：$(group_label "$type" "$old_port")"; return 1; }
+    reading "请输入新的监听端口（回车随机）: " new_port
+    [ -n "$new_port" ] || new_port=$(random_port)
+    validate_port "$new_port" || { red "端口范围需在 1-65535"; return 1; }
+    [ "$new_port" = "$old_port" ] && { yellow "端口未变化。"; return 0; }
+    if inbound_port_in_use "$new_port" "$type"; then
+        red "端口已被现有入站或转发占用：$new_port"
         return 1
     fi
-    save_user "$name" "$uuid" "$outbound_tag" "$flow" "$inbound_type" "$password" "$method" "$port" "$sni"
+
+    backup_dir="${work_dir}/chgport-$(date +%s).bak"
+    mkdir -p "$backup_dir" 2>/dev/null || { red "无法创建备份目录。"; return 1; }
+    for name in $members; do mv "$(user_file "$name")" "$backup_dir/${name}.env"; done
+
+    for name in $members; do
+        f="$backup_dir/${name}.env"
+        u=$(read_env_value "$f" UUID || true)
+        o=$(read_env_value "$f" OUTBOUND_TAG || true)
+        fl=$(read_env_value "$f" FLOW || true)
+        i=$(read_env_value "$f" INBOUND_TYPE || true)
+        pw=$(read_env_value "$f" PASSWORD || true)
+        m=$(read_env_value "$f" METHOD || true)
+        sn=$(read_env_value "$f" H2_SNI || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$new_port" "$sn"
+    done
+
     apply_config
     status=$?
     if [ "$status" -ne 0 ]; then
-        save_user "$name" "$uuid" "$outbound_tag" "$flow" "$inbound_type" "$password" "$method" "$old_port" "$sni"
+        for name in $members; do mv "$backup_dir/${name}.env" "$(user_file "$name")" 2>/dev/null || true; done
+        rmdir "$backup_dir" 2>/dev/null || true
         write_config >/dev/null 2>&1 || true
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
-    allow_port "$port"
-    green "入站端口已更新：$name -> $port"
+    rm -rf "$backup_dir"
+    allow_port "$new_port"
+    green "入站端口已更新：$(group_label "$type" "$old_port") -> ${new_port}（用户: ${members}）"
 }
 
-# 修改入站 SNI；Reality 用户走 change_reality_domain，仅 hy2 支持自定义 SNI
-change_inbound_sni() {
-    local name="$1" file sni old_sni status
-    file=$(user_file "$name")
-    load_user_file "$file"
-    if [ "$INBOUND_TYPE" = "vless-reality" ]; then
+# 修改入站 SNI（组级，整组一致）；Reality 走 change_reality_domain，仅 hy2 支持自定义 SNI
+change_inbound_sni_group() {
+    local type="$1" port="$2" sni old_sni status members name backup_dir f u o fl i pw m sn
+    if [ "$type" = "vless-reality" ]; then
         change_reality_domain
         return
     fi
-    if [ "$INBOUND_TYPE" != "hysteria2" ]; then
+    if [ "$type" != "hysteria2" ]; then
         yellow "该入站类型不支持修改 SNI。"
         return 1
     fi
     reading "请输入新的 SNI（回车默认 ${REALITY_DOMAIN}）: " sni
     [ -n "$sni" ] || sni="$REALITY_DOMAIN"
     validate_domain "$sni" || { red "SNI 需为包含点的 FQDN，且只能包含字母、数字、点或连字符。"; return 1; }
-    old_sni="${H2_SNI:-$REALITY_DOMAIN}"
+    old_sni=$(group_member_field "$type" "$port" H2_SNI "$REALITY_DOMAIN")
     [ "$sni" = "$old_sni" ] && { yellow "SNI 未变化。"; return 0; }
-    save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+    ensure_hy2_cert "$sni" || return 1
+
+    members=$(group_member_names "$type" "$port")
+    backup_dir="${work_dir}/chgsni-$(date +%s).bak"
+    mkdir -p "$backup_dir" 2>/dev/null || { red "无法创建备份目录。"; return 1; }
+    for name in $members; do mv "$(user_file "$name")" "$backup_dir/${name}.env"; done
+
+    for name in $members; do
+        f="$backup_dir/${name}.env"
+        u=$(read_env_value "$f" UUID || true)
+        o=$(read_env_value "$f" OUTBOUND_TAG || true)
+        fl=$(read_env_value "$f" FLOW || true)
+        i=$(read_env_value "$f" INBOUND_TYPE || true)
+        pw=$(read_env_value "$f" PASSWORD || true)
+        m=$(read_env_value "$f" METHOD || true)
+        sn=$(read_env_value "$f" H2_SNI || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$port" "$sni"
+    done
+
     apply_config
     status=$?
     if [ "$status" -ne 0 ]; then
-        save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$old_sni"
+        for name in $members; do mv "$backup_dir/${name}.env" "$(user_file "$name")" 2>/dev/null || true; done
+        rmdir "$backup_dir" 2>/dev/null || true
         write_config >/dev/null 2>&1 || true
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
-    green "SNI 已更新：$name -> $sni"
+    rm -rf "$backup_dir"
+    green "SNI 已更新：$(group_label "$type" "$port") -> $sni"
 }
 
 # 修改 SS/HY2 入站密码
@@ -1927,6 +2140,217 @@ change_inbound_password() {
         return 1
     fi
     green "密码已更新：$name"
+}
+
+# 可见入站用户总数（删除保护用）
+visible_user_count() {
+    local file count=0
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        count=$((count + 1))
+    done
+    printf '%s' "$count"
+}
+
+# 组概要：`alice->direct, bob->落地1`
+group_summary() {
+    local type="$1" port="$2" members first=1 m
+    members=$(group_member_names "$type" "$port")
+    for m in $members; do
+        load_user_file "$(user_file "$m")"
+        [ "$first" -eq 1 ] || printf ', '
+        first=0
+        printf '%s->%s' "$NAME" "$OUTBOUND_TAG"
+    done
+}
+
+# 打印带序号的入站分组列表（依赖 collect_inbound_groups 已执行）
+list_inbound_groups() {
+    local i g type port
+    if [ "${#INBOUND_GROUPS[@]}" -eq 0 ]; then
+        purple "（暂无入站）"
+        return 0
+    fi
+    green "\n=== 入站列表（按 协议+端口 分组） ===\n"
+    for i in "${!INBOUND_GROUPS[@]}"; do
+        g="${INBOUND_GROUPS[$i]}"
+        type="${g%%|*}"
+        port="${g##*|}"
+        purple "$((i + 1))) $(group_label "$type" "$port")  [$(group_summary "$type" "$port")]"
+    done
+}
+
+# 选择一个入站分组到全局 GROUP_TYPE/GROUP_PORT/GROUP_MEMBERS
+select_inbound_group() {
+    local g idx name
+    GROUP_TYPE=""; GROUP_PORT=""; GROUP_MEMBERS=()
+    collect_inbound_groups
+    if [ "${#INBOUND_GROUPS[@]}" -eq 0 ]; then
+        yellow "暂无入站。请先选择 1 初始化节点，或在本菜单选择 1 增加入站。"
+        return 1
+    fi
+    list_inbound_groups
+    pick_index "${#INBOUND_GROUPS[@]}" || return 1
+    g="${INBOUND_GROUPS[$((PICKED_INDEX - 1))]}"
+    GROUP_TYPE="${g%%|*}"
+    GROUP_PORT="${g##*|}"
+    for name in $(group_member_names "$GROUP_TYPE" "$GROUP_PORT"); do
+        GROUP_MEMBERS+=("$name")
+    done
+}
+
+# 选择一个组内用户到全局 GROUP_MEMBER
+pick_group_member() {
+    local type="$1" port="$2" members i name
+    members=$(group_member_names "$type" "$port")
+    [ -n "$members" ] || { yellow "该入站暂无用户。"; return 1; }
+    green "\n请选择该入站中的用户："
+    i=0
+    for name in $members; do
+        i=$((i + 1))
+        purple "${i}) ${name}"
+    done
+    pick_index "$i" || return 1
+    GROUP_MEMBER=$(printf '%s' "$members" | awk -v n="$PICKED_INDEX" '{print $n}')
+}
+
+# 向既有入站分组添加一个用户（绑定到所选 outbound）
+add_user_to_inbound() {
+    local type="$1" port="$2" name outbound_tag uuid pw sni status
+    if [ "$type" = "shadowsocks" ]; then
+        red "SS 暂不支持一端口多用户。"
+        return 1
+    fi
+    list_outbounds
+    reading "请输入该用户绑定的 outbound tag（回车默认 ${direct_outbound_tag}）: " outbound_tag
+    [ -n "$outbound_tag" ] || outbound_tag="$direct_outbound_tag"
+    outbound_exists "$outbound_tag" || { red "outbound 不存在: $outbound_tag"; return 1; }
+    reading "请输入用户名（英文/数字）: " name
+    name=$(sanitize_tag "$name")
+    [ -n "$name" ] || { red "用户名不能为空"; return 1; }
+    user_exists "$name" && { red "用户已存在: $name"; return 1; }
+
+    case "$type" in
+        vless-reality)
+            uuid=$(generate_uuid)
+            save_user "$name" "$uuid" "$outbound_tag" "$default_flow" "$type" "" "" "$port" ""
+            ;;
+        vless)
+            uuid=$(generate_uuid)
+            save_user "$name" "$uuid" "$outbound_tag" "" "$type" "" "" "$port" ""
+            ;;
+        hysteria2)
+            sni=$(group_member_field "$type" "$port" H2_SNI "$REALITY_DOMAIN")
+            ensure_hy2_cert "$sni" || return 1
+            reading "请输入密码（回车自动生成）: " pw
+            [ -n "$pw" ] || pw=$(generate_password)
+            save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "$sni"
+            ;;
+    esac
+
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        rm -f "$(user_file "$name")"
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    allow_port "$port"
+    green "已添加用户：${name} -> ${outbound_tag} ($(group_label "$type" "$port"))"
+    load_user_file "$(user_file "$name")"
+    purple "$(user_link "$UUID" "$NAME" "$FLOW" "" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")\n"
+}
+
+# 删除整个入站分组（连同其所有用户；失败自动还原；保留至少一个用户保护）
+delete_inbound_group() {
+    local type="$1" port="$2" members backup_dir status name x word_count total
+    members=$(group_member_names "$type" "$port")
+    [ -n "$members" ] || { red "入站为空：$(group_label "$type" "$port")"; return 1; }
+    word_count=0; for x in $members; do word_count=$((word_count + 1)); done
+    total=$(visible_user_count)
+    [ "$total" -gt "$word_count" ] || { red "至少保留一个入站用户，不能删除最后一个入站。"; return 1; }
+    backup_dir="${work_dir}/delin-$(date +%s).bak"
+    mkdir -p "$backup_dir" 2>/dev/null || { red "无法创建备份目录。"; return 1; }
+    for name in $members; do mv "$(user_file "$name")" "$backup_dir/${name}.env"; done
+
+    apply_config
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        for name in $members; do mv "$backup_dir/${name}.env" "$(user_file "$name")" 2>/dev/null || true; done
+        rmdir "$backup_dir" 2>/dev/null || true
+        write_config >/dev/null 2>&1 || true
+        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
+        return 1
+    fi
+    rm -rf "$backup_dir"
+    green "已删除入站：$(group_label "$type" "$port")（用户: ${members}）"
+}
+
+# 打印某入站分组内所有用户的连接链接
+show_group_links() {
+    local type="$1" port="$2" members m
+    members=$(group_member_names "$type" "$port")
+    for m in $members; do
+        load_user_file "$(user_file "$m")"
+        green "\n${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}  port=${INBOUND_PORT}"
+        purple "$(user_link "$UUID" "$NAME" "$FLOW" "" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")\n"
+    done
+}
+
+# 单个入站分组的子菜单（循环直到返回）
+manage_group_menu() {
+    local type="$1" port="$2" sub members m
+    while :; do
+        members=$(group_member_names "$type" "$port")
+        clear_screen
+        green "=== 入站: $(group_label "$type" "$port") ===\n"
+        for m in $members; do
+            load_user_file "$(user_file "$m")"
+            purple "  ${NAME} -> ${OUTBOUND_TAG}"
+        done
+        purple ""
+        green "1. 添加用户"
+        green "2. 修改端口"
+        [ "$type" = "hysteria2" ] && green "3. 修改 SNI"
+        green "4. 编辑用户出站"
+        green "5. 删除用户"
+        green "6. 删除入站（连同所有用户）"
+        green "7. 查看连接链接"
+        purple "0. 返回"
+        reading "请输入选择: " sub
+        case "$sub" in
+            0) return ;;
+            1) add_user_to_inbound "$type" "$port" ;;
+            2) change_inbound_port_group "$type" "$port" ;;
+            3) [ "$type" = "hysteria2" ] && change_inbound_sni_group "$type" "$port" || red "无效的选项" ;;
+            4) pick_group_member "$type" "$port" && change_user_outbound_menu "$GROUP_MEMBER" ;;
+            5) pick_group_member "$type" "$port" && delete_user "$GROUP_MEMBER" ;;
+            6) delete_inbound_group "$type" "$port" && return ;;
+            7) show_group_links "$type" "$port" ;;
+            *) red "无效的选项" ;;
+        esac
+        [ "$sub" != "0" ] && { read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'; echo ""; }
+    done
+}
+
+manage_inbound_menu() {
+    local sub
+    require_reality_state || return 1
+    clear_screen
+    green "=== 入站管理 ===\n"
+    green "1. 增加入站"
+    green "2. 选择一个入站进行管理"
+    purple "0. 返回主菜单"
+    reading "请输入选择: " sub
+    case "$sub" in
+        1) add_inbound ;;
+        2) select_inbound_group && manage_group_menu "$GROUP_TYPE" "$GROUP_PORT" ;;
+        0) return ;;
+        *) red "无效的选项" ;;
+    esac
 }
 
 decode_import_input() {
@@ -2147,28 +2571,35 @@ import_outbound_from_input() {
 }
 
 import_outbound_auto() {
-    local outbound_tag user_name
+    local outbound_tag g type port
     require_reality_state || return 1
     import_outbound_from_input || return 1
     outbound_tag="$imported_outbound_tag"
 
-    collect_inbound_names
-    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+    collect_inbound_groups
+    if [ "${#INBOUND_GROUPS[@]}" -eq 0 ]; then
         yellow "当前没有任何入站，已自动创建绑定该落地的新用户。"
         create_bound_user_for_outbound "$outbound_tag" || return 1
         return 0
     fi
 
-    green "落地 ${outbound_tag} 已添加，请选择要绑定到该落地的入站："
-    list_inbounds_numbered
-    pick_index "${#INBOUND_NAMES[@]}" || { rm -f "$(outbound_file "$outbound_tag")"; return 1; }
-    user_name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
-    if ! change_user_outbound "$user_name" "$outbound_tag"; then
+    green "落地 ${outbound_tag} 已添加，请选择要把该落地挂到哪个入站（将在其上新建一个用户，不覆盖现有用户）："
+    list_inbound_groups
+    pick_index "${#INBOUND_GROUPS[@]}" || { rm -f "$(outbound_file "$outbound_tag")"; return 1; }
+    g="${INBOUND_GROUPS[$((PICKED_INDEX - 1))]}"
+    type="${g%%|*}"
+    port="${g##*|}"
+    if [ "$type" = "shadowsocks" ]; then
+        red "SS 暂不支持一端口多用户，请在入站管理中选择 HY2/VLESS/VLESS+Reality 入站。"
         rm -f "$(outbound_file "$outbound_tag")"
         write_config >/dev/null 2>&1 || true
         return 1
     fi
-    green "已绑定：入站 ${user_name} -> 落地 ${outbound_tag}"
+    if ! bind_landing_to_group "$outbound_tag" "$type" "$port"; then
+        rm -f "$(outbound_file "$outbound_tag")"
+        write_config >/dev/null 2>&1 || true
+        return 1
+    fi
 }
 
 users_for_outbound() {
@@ -2569,9 +3000,9 @@ manage_route_menu() {
     load_outbound_file "$(outbound_file "$outbound_tag")"
     users=$(users_for_outbound "$outbound_tag")
     green "\n落地：${outbound_tag} | ${TYPE} | ${DISPLAY_NAME:-$SERVER:$SERVER_PORT}"
-    purple "绑定入站：${users:-无}\n"
+    purple "绑定用户：${users:-无}\n"
     green "1. 删除该落地"
-    green "2. 修改绑定的入站"
+    green "2. 改绑到某个用户"
     purple "0. 返回主菜单"
     reading "请输入选择: " sub
 
@@ -2584,61 +3015,20 @@ manage_route_menu() {
 }
 
 rebind_outbound_inbound() {
-    local outbound_tag="$1" user_name
-    collect_inbound_names
-    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
+    local outbound_tag="$1" g type port
+    collect_inbound_groups
+    if [ "${#INBOUND_GROUPS[@]}" -eq 0 ]; then
         yellow "暂无入站可绑定。"
         return 1
     fi
-    green "\n请选择要绑定到落地（${outbound_tag}）的入站（该入站的原落地绑定将被覆盖）："
-    list_inbounds_numbered
-    pick_index "${#INBOUND_NAMES[@]}" || return 1
-    user_name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
-    change_user_outbound "$user_name" "$outbound_tag" || return 1
-}
-
-manage_inbound_settings_menu() {
-    local name sub port_n sni_n pass_n out_n del_n
-    require_reality_state || return 1
-    clear_screen
-    green "=== 入站设置 ===\n"
-    collect_inbound_names
-    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
-        yellow "暂无入站。请先选择 1 初始化节点，或 3 增加入站。"
-        return 1
-    fi
-    list_inbounds_numbered
-    pick_index "${#INBOUND_NAMES[@]}" || return 1
-    name="${INBOUND_NAMES[$((PICKED_INDEX - 1))]}"
-    load_user_file "$(user_file "$name")"
-    green "\n${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}\n"
-
-    port_n=1
-    case "$INBOUND_TYPE" in
-        vless-reality) sni_n=2; pass_n=""; out_n=3; del_n=4 ;;
-        vless)       sni_n=""; pass_n=""; out_n=2; del_n=3 ;;
-        shadowsocks) sni_n=""; pass_n=2; out_n=3; del_n=4 ;;
-        hysteria2)   sni_n=2; pass_n=3; out_n=4; del_n=5 ;;
-        *) red "未知入站类型：$INBOUND_TYPE"; return 1 ;;
-    esac
-
-    green "${port_n}. 修改端口"
-    [ -n "$sni_n" ] && green "${sni_n}. 修改 SNI"
-    [ -n "$pass_n" ] && green "${pass_n}. 修改密码"
-    green "${out_n}. 修改绑定的落地"
-    red "${del_n}. 删除该入站"
-    purple "0. 返回主菜单"
-    reading "请输入选择: " sub
-
-    case "$sub" in
-        0) return ;;
-        "$port_n") change_inbound_port "$name" ;;
-        "$sni_n") change_inbound_sni "$name" ;;
-        "$pass_n") change_inbound_password "$name" ;;
-        "$out_n") change_user_outbound_menu "$name" ;;
-        "$del_n") delete_user "$name" ;;
-        *) red "无效的选项" ;;
-    esac
+    green "\n请选择要把落地（${outbound_tag}）绑到哪个入站："
+    list_inbound_groups
+    pick_index "${#INBOUND_GROUPS[@]}" || return 1
+    g="${INBOUND_GROUPS[$((PICKED_INDEX - 1))]}"
+    type="${g%%|*}"
+    port="${g##*|}"
+    pick_group_member "$type" "$port" || return 1
+    change_user_outbound "$GROUP_MEMBER" "$outbound_tag" || return 1
 }
 
 manage_singbox() {
@@ -2716,16 +3106,13 @@ menu() {
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
     green "2. 添加落地"
-    green "3. 增加入站（代理服务器）"
-    green "4. 查看节点和落地摘要"
-    green "5. 管理落地"
-    green "6. 修改入站设置"
-    green "7. TCP/UDP 转发管理"
-    green "8. sing-box 服务管理"
-    green "9. 查看 sing-box 日志"
-    red "10. 卸载 sing-box"
+    green "3. 入站管理"
+    green "4. 落地管理"
+    green "5. TCP/UDP 转发管理"
+    green "6. 服务与日志"
+    red "7. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-10): " choice
+    reading "请输入选择(0-7): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -2742,16 +3129,13 @@ while true; do
     case "$choice" in
         1) run_install_flow ;;
         2) import_outbound_auto ;;
-        3) add_inbound ;;
-        4) show_reality_info; list_outbounds; list_forwards_cli ;;
-        5) manage_route_menu ;;
-        6) manage_inbound_settings_menu ;;
-        7) manage_forwards_menu ;;
-        8) manage_singbox ;;
-        9) show_singbox_logs ;;
-        10) uninstall_singbox ;;
+        3) manage_inbound_menu ;;
+        4) manage_route_menu ;;
+        5) manage_forwards_menu ;;
+        6) manage_singbox ;;
+        7) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 10" ;;
+        *) red "无效的选项，请输入 0 到 7" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
