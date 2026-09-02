@@ -19,7 +19,7 @@
 - 支持 Hysteria2 多用户入站：自签名证书、默认随机高位端口、TLS，SNI 默认为当前 Reality 域名，可自定义端口和 SNI，同一端口多用户按用户名区分路由
 - 支持 VLESS / VLESS+Reality 多用户入站：同一端口多用户按 UUID 区分路由（Reality 用户共享主端口，用 `auth_user` 区分）
 - Shadowsocks 暂为单用户独立端口（一端口多用户需 `2022-blake3-*` 加密与 master key，暂未开放）
-- sing-box 守护：进程被杀自动重启；用户手动“停止”时不复活（systemd 用 `Restart=always`，OpenRC 用内建 supervise-daemon）
+- sing-box 守护：进程被杀自动重启；用户手动“停止”时不复活（systemd 用 `Restart=always`，OpenRC 用 shell 包装器循环 respawn）
 - 支持 TCP/UDP 纯转发：基于用户态 realm 转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者，无需 iptables（可在无 iptables / 无特权容器环境工作）
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
@@ -124,4 +124,4 @@ sb
 - 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/`、`/etc/sing-box/outbounds.d/` 和 `/etc/sing-box/forwards.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
 - `-port` 指定的是 Reality 主入站端口；添加落地时若没有任何入站，会自动创建使用该端口的 Reality 用户
-- 守护：只要未手动“停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC supervise-daemon）；手动停止后不会复活
+- 守护：只要未手动“停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC respawn 包装器）；手动停止后不会复活

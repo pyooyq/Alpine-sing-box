@@ -1282,31 +1282,37 @@ EOF
 }
 
 write_openrc_service() {
-    # 启用 OpenRC 内建 supervise-daemon 实现"被杀自动重启、手动停止不复活"
-    if command_exists supervise-daemon; then
-        cat > /etc/init.d/sing-box << EOF
+    # 守护：给 sing-box 套一个 shell 包装器循环。子进程退出/被杀则重启；
+    # `rc-service sing-box stop` 时清理子进程并退出，不复活。不依赖 supervise-daemon，纯 OpenRC 生效。
+    cat > "${work_dir}/singbox-wrapper.sh" << EOF
+#!/bin/sh
+# sing-box 守护包装器：子进程退出/被杀则重启；rc-service stop 时清理子进程并退出
+BIN="${work_dir}/${server_name}"
+CONF="${config_dir}"
+child=""
+cleanup() {
+    [ -n "\$child" ] && kill "\$child" 2>/dev/null || true
+    exit 0
+}
+trap 'cleanup' TERM INT
+while :; do
+    "\$BIN" run -c "\$CONF" &
+    child=\$!
+    wait "\$child" 2>/dev/null
+    child=""
+    sleep 3
+done
+EOF
+    chmod +x "${work_dir}/singbox-wrapper.sh"
+
+    cat > /etc/init.d/sing-box << EOF
 #!/sbin/openrc-run
 
-supervisor="supervise-daemon"
-description="sing-box service"
-command="${work_dir}/${server_name}"
-command_args="run -c ${config_dir}"
-command_background=true
-pidfile="/var/run/sing-box.pid"
-respawn_delay=5
-EOF
-    else
-        cat > /etc/init.d/sing-box << EOF
-#!/sbin/openrc-run
-
-description="sing-box service"
-command="${work_dir}/${server_name}"
-command_args="run -c ${config_dir}"
+description="sing-box service (respawn wrapper)"
+command="${work_dir}/singbox-wrapper.sh"
 command_background=true
 pidfile="/var/run/sing-box.pid"
 EOF
-        yellow "本机 OpenRC 无 supervise-daemon，sing-box 守护降级为不自动重启。"
-    fi
 
     chmod +x /etc/init.d/sing-box
     rc-update add sing-box default >/dev/null 2>&1
