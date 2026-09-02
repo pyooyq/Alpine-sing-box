@@ -1,13 +1,13 @@
 # Alpine-sing-box
 
-这是一个精简版 `sing-box` 安装/管理脚本，支持 VLESS Reality、普通 VLESS、Shadowsocks、Hysteria2 入站，并支持多个入站按用户名绑定到不同 outbound。
+这是一个精简版 `sing-box` 安装/管理脚本，支持 VLESS Reality、普通 VLESS、Shadowsocks、Hysteria2、HTTP、SOCKS5 入站，并支持多个入站按用户名绑定到不同 outbound。
 
 ## 功能
 
 - 优先复用本机已安装且可执行的 `sing-box`
 - 本机没有可用 `sing-box` 时先尝试 Alpine 包安装，再补兼容库并下载上游二进制
 - 生成精简 sing-box 入站配置，默认使用 VLESS Reality 作为中转入口
-- 支持多个入站用户，每个用户独立 UUID/name 或 SS 密码
+- 支持多个入站用户，每个用户独立 UUID/name 或 SS 密码或 HTTP/SOCKS5 用户名+密码
 - 添加落地时自动创建独立 VLESS Reality 用户（当前无任何入站时兜底）
 - 支持按用户绑定 outbound：本机直连 `direct`、SOCKS5、Shadowsocks、VLESS、HTTP
 - 默认创建 `default-direct` 用户并绑定 `direct`，保留当前 VPS 本机直接作为节点的用法
@@ -18,8 +18,10 @@
 - 一种协议一个入站（一个端口）可挂多个用户，每个用户独立绑定不同出站（本机 `direct` 或落地）。如同一 Hysteria2 端口上既有走直连的用户，也有走落地的用户，互不覆盖
 - 支持 Hysteria2 多用户入站：自签名证书、默认随机高位端口、TLS，SNI 默认为当前 Reality 域名，可自定义端口和 SNI，同一端口多用户按用户名区分路由
 - 支持 VLESS / VLESS+Reality 多用户入站：同一端口多用户按 UUID 区分路由（Reality 用户共享主端口，用 `auth_user` 区分）
+- 支持 HTTP / SOCKS5 多用户入站：用户名+密码鉴权（默认随机），同一端口多用户按代理用户名区分路由，客户端用 `http://user:pass@host:port`、`socks5://user:pass@host:port` 标准代理链接连接
 - Shadowsocks 暂为单用户独立端口（一端口多用户需 `2022-blake3-*` 加密与 master key，暂未开放）
 - sing-box 守护：进程被杀自动重启；用户手动“停止”时不复活（systemd 用 `Restart=always`，OpenRC 用 shell 包装器循环 respawn）
+- 主菜单“列出节点链接”统一列出所有入站的连接链接（协议、端口、出站）
 - 支持 TCP/UDP 纯转发：基于用户态 realm 转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者，无需 iptables（可在无 iptables / 无特权容器环境工作）
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
@@ -74,7 +76,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持：安装/初始化节点、添加落地、入站管理（增/删/改入站与用户）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载。
+菜单支持：安装/初始化节点、添加落地、列出节点链接、入站管理（增/删/改入站与用户）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载。
 
 ## 使用方式
 
@@ -83,9 +85,10 @@ sb
 如需把当前 VPS 作为中转入口使用，可以在菜单中：
 
 1. 使用“添加落地”，直接粘贴 `ss://`、`vless://`、`http://`、`https://`、`socks5://`（支持带/不带密码）或其 base64 内容；脚本识别协议后列出现有入站（按 协议+端口 分组），由你按序号选择要挂到哪个入站。落地会作为该入站上的**新用户**（不覆盖已有用户），若当前没有任何入站则自动创建一个绑定该落地的新用户。
-2. 进入“入站管理”可增加入站（选协议、端口、绑定的 outbound 建第一个用户），或选中某个入站后添加用户 / 修改端口 / 编辑用户出站 / 删除用户 / 删除整个入站 / 查看连接链接。增加用户时若端口已有同协议入站，新用户会加入该入站（同端口多用户）。
+2. 进入“入站管理”可增加入站（选协议、端口、绑定的 outbound 建第一个用户），或选中某个入站后添加用户 / 修改端口 / 编辑用户出站 / 删除用户 / 删除整个入站。增加用户时若端口已有同协议入站，新用户会加入该入站（同端口多用户）。
 3. 进入“落地管理”按序号列出所有落地及其绑定用户；选择某个落地后可删除它，或把它改绑到某个用户。
-4. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户（`auth_user`，Reality/VLESS/Hysteria2）路由到绑定的 outbound。
+4. 主菜单“列出节点链接”会列出所有入站的连接链接（协议、端口、出站）。
+5. 客户端使用脚本生成的对应协议链接连接当前 VPS；服务端会按入站用户（`auth_user`，Reality/VLESS/Hysteria2 用用户名，HTTP/SOCKS5 用代理账号）路由到绑定的 outbound。
 
 内置 outbound：
 

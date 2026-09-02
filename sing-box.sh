@@ -34,6 +34,8 @@ reality_inbound_tag="reality-in"
 vless_inbound_tag="vless-in"
 ss_inbound_tag="ss-in"
 hy2_inbound_tag="hy2-in"
+http_inbound_tag="http-in"
+socks_inbound_tag="socks-in"
 direct_outbound_tag="direct"
 block_outbound_tag="block"
 default_user_name="default-direct"
@@ -398,7 +400,7 @@ load_user_file() {
     esac
     # 保证 Reality 用户端口解析前 PORT 已加载（避免在 load_state 之前调用时的空端口）
     [ -n "$PORT" ] || load_state
-    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD H2_SNI
+    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD H2_SNI USERNAME
     NAME=$(read_env_value "$file" NAME || true)
     UUID=$(read_env_value "$file" UUID || true)
     FLOW=$(read_env_value "$file" FLOW || true)
@@ -408,6 +410,7 @@ load_user_file() {
     METHOD=$(read_env_value "$file" METHOD || true)
     PASSWORD=$(read_env_value "$file" PASSWORD || true)
     H2_SNI=$(read_env_value "$file" H2_SNI || true)
+    USERNAME=$(read_env_value "$file" USERNAME || true)
     FLOW="${FLOW:-$default_flow}"
     OUTBOUND_TAG="${OUTBOUND_TAG:-$direct_outbound_tag}"
     INBOUND_TYPE="${INBOUND_TYPE:-$default_inbound_type}"
@@ -462,7 +465,7 @@ load_outbound_file() {
 }
 
 save_user() {
-    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" file
+    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" file
     name=$(sanitize_tag "$name")
     file=$(user_file "$name")
     {
@@ -475,6 +478,7 @@ save_user() {
         write_env_line METHOD "$method"
         write_env_line PASSWORD "$password"
         [ -n "$sni" ] && write_env_line H2_SNI "$sni"
+        [ -n "$username" ] && write_env_line USERNAME "$username"
     } > "$file"
     chmod 600 "$file"
 }
@@ -815,6 +819,8 @@ inbound_tag_for_group() {
         vless) printf '%s-%s' "$vless_inbound_tag" "$port" ;;
         shadowsocks) printf '%s-%s' "$ss_inbound_tag" "$port" ;;
         hysteria2) printf '%s-%s' "$hy2_inbound_tag" "$port" ;;
+        http) printf '%s-%s' "$http_inbound_tag" "$port" ;;
+        socks) printf '%s-%s' "$socks_inbound_tag" "$port" ;;
         *) printf '%s' "$reality_inbound_tag" ;;
     esac
 }
@@ -891,6 +897,8 @@ group_label() {
         vless) printf 'VLESS :%s' "$2" ;;
         shadowsocks) printf 'SS :%s' "$2" ;;
         hysteria2) printf 'HY2 :%s' "$2" ;;
+        http) printf 'HTTP :%s' "$2" ;;
+        socks) printf 'SOCKS5 :%s' "$2" ;;
         *) printf '%s :%s' "$1" "$2" ;;
     esac
 }
@@ -923,6 +931,12 @@ render_group_users_json() {
                 printf '          "password": %s\n' "$(json_string "$PASSWORD")"
                 printf '        }'
                 ;;
+            http|socks)
+                printf '        {\n'
+                printf '          "username": %s,\n' "$(json_string "$USERNAME")"
+                printf '          "password": %s\n' "$(json_string "$PASSWORD")"
+                printf '        }'
+                ;;
         esac
     done
 }
@@ -939,6 +953,9 @@ has_inbound_type() {
                 ;;
             hysteria2)
                 [ -n "$NAME" ] && [ -n "$PASSWORD" ] && validate_port "$INBOUND_PORT" && return 0
+                ;;
+            http|socks)
+                [ -n "$NAME" ] && [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] && validate_port "$INBOUND_PORT" && return 0
                 ;;
             *)
                 [ -n "$NAME" ] && [ -n "$UUID" ] && validate_port "$INBOUND_PORT" && return 0
@@ -1036,6 +1053,20 @@ $(render_group_users_json "$type" "$port" hysteria2)
     }
 EOF
                 ;;
+            http|socks)
+                tag=$(inbound_tag_for_group "$type" "$port")
+                cat << EOF
+    {
+      "type": "${type}",
+      "tag": "${tag}",
+      "listen": "::",
+      "listen_port": ${port},
+      "users": [
+$(render_group_users_json "$type" "$port" "$type")
+      ]
+    }
+EOF
+                ;;
         esac
     done
 }
@@ -1125,7 +1156,7 @@ render_outbound_json() {
 }
 
 render_route_rules_json() {
-    local file first=1 name outbound_tag inbound_type inbound_port inbound_tag
+    local file first=1 name auth_user_name outbound_tag inbound_type inbound_port inbound_tag
     local fallback_inbounds="" fallback_seen=""
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
@@ -1134,6 +1165,11 @@ render_route_rules_json() {
         name="$NAME"
         outbound_tag="$OUTBOUND_TAG"
         inbound_type="$INBOUND_TYPE"
+        # http/socks 的 auth_user 匹配的是代理用户名（users 用 username 字段）
+        auth_user_name="$NAME"
+        case "$inbound_type" in
+            http|socks) auth_user_name="$USERNAME" ;;
+        esac
         if [ "$inbound_type" = "vless-reality" ]; then
             inbound_port="$PORT"
         else
@@ -1157,7 +1193,7 @@ render_route_rules_json() {
         printf '      {\n'
         printf '        "inbound": [%s],\n' "$(json_string "$inbound_tag")"
         # SS 现为单用户（无 users 数组/命名用户），连接无 auth_user，故不带该匹配
-        [ "$inbound_type" != "shadowsocks" ] && printf '        "auth_user": [%s],\n' "$(json_string "$name")"
+        [ "$inbound_type" != "shadowsocks" ] && printf '        "auth_user": [%s],\n' "$(json_string "$auth_user_name")"
         printf '        "action": "route",\n'
         printf '        "outbound": %s\n' "$(json_string "$outbound_tag")"
         printf '      }'
@@ -1399,7 +1435,7 @@ get_server_ip() {
 }
 
 user_link() {
-    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" link userinfo
+    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" link userinfo
     load_state
     [ -n "$server_ip" ] || server_ip=$(get_server_ip)
     [ -n "$sni" ] || sni="$REALITY_DOMAIN"
@@ -1413,6 +1449,12 @@ user_link() {
             ;;
         hysteria2)
             link="hysteria2://$(url_encode "$password")@${server_ip}:${inbound_port}?sni=${sni}&insecure=1#${name}"
+            ;;
+        http)
+            link="http://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${inbound_port}#${name}"
+            ;;
+        socks)
+            link="socks5://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${inbound_port}#${name}"
             ;;
         *)
             link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${flow:-$default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
@@ -1436,9 +1478,11 @@ list_outbounds() {
 # 判定某个已 load_user_file 的用户是否为可见、可管理的入站（过滤缺字段的脏数据）
 user_is_visible() {
     [ -n "$NAME" ] || return 1
-    [ "$INBOUND_TYPE" = "shadowsocks" ] && [ -z "$PASSWORD" ] && return 1
-    [ "$INBOUND_TYPE" = "hysteria2" ] && [ -z "$PASSWORD" ] && return 1
-    { [ "$INBOUND_TYPE" != "shadowsocks" ] && [ "$INBOUND_TYPE" != "hysteria2" ]; } && [ -z "$UUID" ] && return 1
+    case "$INBOUND_TYPE" in
+        shadowsocks|hysteria2) [ -n "$PASSWORD" ] || return 1 ;;
+        http|socks) [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || return 1 ;;
+        *) [ -n "$UUID" ] || return 1 ;;
+    esac
     return 0
 }
 
@@ -1554,7 +1598,7 @@ show_reality_info() {
         [ -f "$file" ] || continue
         load_user_file "$file"
         [ -n "$NAME" ] || continue
-        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")
+        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")
         purple "${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}"
         purple "$link\n"
     done
@@ -1764,12 +1808,16 @@ select_inbound_type() {
     purple "2. VLESS（无 Reality/TLS）"
     purple "3. Shadowsocks"
     purple "4. Hysteria2（自签名 TLS，默认随机高位端口）"
+    purple "5. HTTP（用户名/密码代理）"
+    purple "6. SOCKS5（用户名/密码代理）"
     reading "请输入编号（默认 1）: " choice
     case "${choice:-1}" in
         1) SELECTED_INBOUND_TYPE="vless-reality" ;;
         2) SELECTED_INBOUND_TYPE="vless" ;;
         3) SELECTED_INBOUND_TYPE="shadowsocks" ;;
         4) SELECTED_INBOUND_TYPE="hysteria2" ;;
+        5) SELECTED_INBOUND_TYPE="http" ;;
+        6) SELECTED_INBOUND_TYPE="socks" ;;
         *) red "无效的入站协议。"; return 1 ;;
     esac
 }
@@ -1779,6 +1827,8 @@ inbound_label() {
         vless) printf 'VLESS' ;;
         shadowsocks) printf 'SS' ;;
         hysteria2) printf 'HY2' ;;
+        http) printf 'HTTP' ;;
+        socks) printf 'SOCKS5' ;;
         *) printf 'VLESS+Reality' ;;
     esac
 }
@@ -1827,6 +1877,7 @@ select_inbound_profile() {
     SELECTED_INBOUND_PASSWORD=""
     SELECTED_INBOUND_METHOD="$default_ss_method"
     SELECTED_INBOUND_SNI=""
+    SELECTED_INBOUND_USERNAME=""
     if [ "$SELECTED_INBOUND_TYPE" = "shadowsocks" ]; then
         reading "请输入 SS 入站密码（留空自动生成）: " SELECTED_INBOUND_PASSWORD
         [ -n "$SELECTED_INBOUND_PASSWORD" ] || SELECTED_INBOUND_PASSWORD=$(generate_password)
@@ -1835,6 +1886,11 @@ select_inbound_profile() {
         [ -n "$SELECTED_INBOUND_PASSWORD" ] || SELECTED_INBOUND_PASSWORD=$(generate_password)
         reading "请输入 HY2 SNI（回车默认 ${REALITY_DOMAIN}）: " SELECTED_INBOUND_SNI
         [ -n "$SELECTED_INBOUND_SNI" ] || SELECTED_INBOUND_SNI="$REALITY_DOMAIN"
+    elif [ "$SELECTED_INBOUND_TYPE" = "http" ] || [ "$SELECTED_INBOUND_TYPE" = "socks" ]; then
+        reading "请输入代理用户名（留空随机）: " SELECTED_INBOUND_USERNAME
+        [ -n "$SELECTED_INBOUND_USERNAME" ] || SELECTED_INBOUND_USERNAME="user-$(generate_password)"
+        reading "请输入代理密码（留空自动生成）: " SELECTED_INBOUND_PASSWORD
+        [ -n "$SELECTED_INBOUND_PASSWORD" ] || SELECTED_INBOUND_PASSWORD=$(generate_password)
     fi
 }
 
@@ -1844,13 +1900,14 @@ use_default_inbound_profile() {
     SELECTED_INBOUND_PASSWORD=""
     SELECTED_INBOUND_METHOD="$default_ss_method"
     SELECTED_INBOUND_SNI=""
+    SELECTED_INBOUND_USERNAME=""
 }
 
 save_selected_user() {
     if [ "$SELECTED_INBOUND_TYPE" = "hysteria2" ]; then
         ensure_hy2_cert "${SELECTED_INBOUND_SNI:-$REALITY_DOMAIN}" || return 1
     fi
-    save_user "$1" "$2" "$3" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}"
+    save_user "$1" "$2" "$3" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}" "${SELECTED_INBOUND_USERNAME:-}"
 }
 
 create_bound_user_for_outbound() {
@@ -1877,7 +1934,7 @@ create_bound_user_for_outbound() {
 
     allow_port "$SELECTED_INBOUND_PORT"
     green "已添加落地并自动绑定用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
+    purple "$(user_link "$uuid" "$name" "$default_flow" "$(get_server_ip)" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "")\n"
 }
 
 add_inbound() {
@@ -1914,7 +1971,7 @@ add_inbound() {
     fi
 
     uuid=$(generate_uuid)
-    save_user "$name" "$uuid" "$outbound_tag" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}"
+    save_user "$name" "$uuid" "$outbound_tag" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "${SELECTED_INBOUND_SNI:-}" "${SELECTED_INBOUND_USERNAME:-}"
 
     apply_config
     status=$?
@@ -1931,12 +1988,12 @@ add_inbound() {
     else
         green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
     fi
-    purple "$(user_link "$uuid" "$name" "$default_flow" "" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI")\n"
+    purple "$(user_link "$uuid" "$name" "$default_flow" "$(get_server_ip)" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "$SELECTED_INBOUND_USERNAME")\n"
 }
 
 # 把已导入的落地绑定为指定入站分组上的【新用户】（自动生成凭据，不覆盖现有用户）
 bind_landing_to_group() {
-    local outbound_tag="$1" type="$2" port="$3" name uuid pw sni status
+    local outbound_tag="$1" type="$2" port="$3" name uuid pw sni username status
     name=$(sanitize_tag "$outbound_tag")
     if user_exists "$name"; then
         name="${name}-$(date +%s)"
@@ -1955,6 +2012,11 @@ bind_landing_to_group() {
             ensure_hy2_cert "$sni" || return 1
             pw=$(generate_password)
             save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "$sni"
+            ;;
+        http|socks)
+            username="user-$(generate_password)"
+            pw=$(generate_password)
+            save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "" "$username"
             ;;
         *)
             red "不支持的入站类型：$type"
@@ -2224,7 +2286,7 @@ pick_group_member() {
 
 # 向既有入站分组添加一个用户（绑定到所选 outbound）
 add_user_to_inbound() {
-    local type="$1" port="$2" name outbound_tag uuid pw sni status
+    local type="$1" port="$2" name outbound_tag uuid pw sni username status
     if [ "$type" = "shadowsocks" ]; then
         red "SS 暂不支持一端口多用户。"
         return 1
@@ -2254,6 +2316,13 @@ add_user_to_inbound() {
             [ -n "$pw" ] || pw=$(generate_password)
             save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "$sni"
             ;;
+        http|socks)
+            reading "请输入代理用户名（留空随机）: " username
+            [ -n "$username" ] || username="user-$(generate_password)"
+            reading "请输入代理密码（回车自动生成）: " pw
+            [ -n "$pw" ] || pw=$(generate_password)
+            save_user "$name" "" "$outbound_tag" "" "$type" "$pw" "" "$port" "" "$username"
+            ;;
     esac
 
     apply_config
@@ -2267,7 +2336,7 @@ add_user_to_inbound() {
     allow_port "$port"
     green "已添加用户：${name} -> ${outbound_tag} ($(group_label "$type" "$port"))"
     load_user_file "$(user_file "$name")"
-    purple "$(user_link "$UUID" "$NAME" "$FLOW" "" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")\n"
+    purple "$(user_link "$UUID" "$NAME" "$FLOW" "$(get_server_ip)" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")\n"
 }
 
 # 删除整个入站分组（连同其所有用户；失败自动还原；保留至少一个用户保护）
@@ -2295,15 +2364,20 @@ delete_inbound_group() {
     green "已删除入站：$(group_label "$type" "$port")（用户: ${members}）"
 }
 
-# 打印某入站分组内所有用户的连接链接
-show_group_links() {
-    local type="$1" port="$2" members m
-    members=$(group_member_names "$type" "$port")
-    for m in $members; do
-        load_user_file "$(user_file "$m")"
-        green "\n${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}  port=${INBOUND_PORT}"
-        purple "$(user_link "$UUID" "$NAME" "$FLOW" "" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI")\n"
+# 主菜单"列出节点链接"：遍历所有可见用户，打印其类型/端口/出站与标准代理链接
+list_node_links() {
+    local file found=0 server_ip
+    server_ip=$(get_server_ip)
+    green "\n=== 全部节点链接 ===\n"
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        found=1
+        green "${NAME} ($(inbound_label "$INBOUND_TYPE"), port=${INBOUND_PORT}) -> ${OUTBOUND_TAG}"
+        purple "$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")\n"
     done
+    [ "$found" -eq 1 ] || yellow "（暂无可见节点）"
 }
 
 # 单个入站分组的子菜单（循环直到返回）
@@ -2324,7 +2398,6 @@ manage_group_menu() {
         green "4. 编辑用户出站"
         green "5. 删除用户"
         green "6. 删除入站（连同所有用户）"
-        green "7. 查看连接链接"
         purple "0. 返回"
         reading "请输入选择: " sub
         case "$sub" in
@@ -2335,7 +2408,6 @@ manage_group_menu() {
             4) pick_group_member "$type" "$port" && change_user_outbound_menu "$GROUP_MEMBER" ;;
             5) pick_group_member "$type" "$port" && delete_user "$GROUP_MEMBER" ;;
             6) delete_inbound_group "$type" "$port" && return ;;
-            7) show_group_links "$type" "$port" ;;
             *) red "无效的选项" ;;
         esac
         [ "$sub" != "0" ] && { read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'; echo ""; }
@@ -3112,13 +3184,14 @@ menu() {
     purple "sing-box 状态: ${singbox_status}\n"
     green "1. 安装 / 初始化节点"
     green "2. 添加落地"
-    green "3. 入站管理"
-    green "4. 落地管理"
-    green "5. TCP/UDP 转发管理"
-    green "6. 服务与日志"
-    red "7. 卸载 sing-box"
+    green "3. 列出节点链接"
+    green "4. 入站管理"
+    green "5. 落地管理"
+    green "6. TCP/UDP 转发管理"
+    green "7. 服务与日志"
+    red "8. 卸载 sing-box"
     red "0. 退出脚本"
-    reading "请输入选择(0-7): " choice
+    reading "请输入选择(0-8): " choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -3135,13 +3208,14 @@ while true; do
     case "$choice" in
         1) run_install_flow ;;
         2) import_outbound_auto ;;
-        3) manage_inbound_menu ;;
-        4) manage_route_menu ;;
-        5) manage_forwards_menu ;;
-        6) manage_singbox ;;
-        7) uninstall_singbox ;;
+        3) list_node_links ;;
+        4) manage_inbound_menu ;;
+        5) manage_route_menu ;;
+        6) manage_forwards_menu ;;
+        7) manage_singbox ;;
+        8) uninstall_singbox ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 7" ;;
+        *) red "无效的选项，请输入 0 到 8" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""
