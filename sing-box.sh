@@ -51,6 +51,8 @@ realm_work="/etc/realm"
 # Hysteria2 自签名证书（所有 hy2 入站共用；客户端通常以 insecure=1 连接，不校验证书）
 hy2_cert="${work_dir}/hy2-cert.pem"
 hy2_key="${work_dir}/hy2-key.pem"
+# 记录证书当前 CN=SNI，用于 SNI 变化时重新生成自签名证书
+hy2_sni_file="${work_dir}/hy2-sni"
 
 usage() {
     cat << EOF
@@ -156,7 +158,9 @@ write_env_line() {
     printf '%s="%s"\n' "$1" "$(env_escape "$2")"
 }
 
-# 解析 IPv4/IPv6 地址:端口。IPv6 地址需带方括号，如 [::1]:8080
+# 解析 IPv4/IPv6 地址:端口。带方括号的 IPv6（如 [::1]:8080）按方括号处理；
+# 无方括号但含多个冒号时按裸 IPv6 处理：仅当 '::' 压缩形式且末段为数字时才把末段视为端口，
+# 否则整段作为地址、端口留空，交由上层 validate_port 明确报错（避免把 IPv6 末段误当端口）。
 split_hostport() {
     local hp="$1" addr port
     # 去掉 authority 之后的路径（见 import_http_uri：http 链接常带末尾 / 或 /path）
@@ -171,6 +175,16 @@ split_hostport() {
         # IPv4 或域名: 1.2.3.4:8080
         addr=${hp%:*}
         port=${hp##*:}
+        # 无方括号且含两个以上冒号 -> 疑似裸 IPv6（带或不带端口）
+        if [[ "$hp" == *:*:* ]]; then
+            if [[ "$port" =~ ^[0-9]+$ ]] && [[ "$addr" == *"::"* ]]; then
+                : # 压缩式 IPv6 + 末段数字端口，视为 addr:port
+            else
+                # 无法可靠判定端口：整段作为地址、端口留空，交由上层校验报错
+                addr="$hp"
+                port=""
+            fi
+        fi
     fi
     printf '%s|%s' "$addr" "$port"
 }
@@ -761,8 +775,14 @@ generate_password() {
 
 # 生成 Hysteria2 自签名证书（所有 hy2 入站共用；客户端以 insecure=1 连接，不校验证书）
 ensure_hy2_cert() {
-    local sni="${1:-$REALITY_DOMAIN}"
-    [ -f "$hy2_cert" ] && [ -f "$hy2_key" ] && return 0
+    local sni="${1:-$REALITY_DOMAIN}" current
+    current=$(cat "$hy2_sni_file" 2>/dev/null || true)
+    # 证书、密钥存在且记录到的 SNI 与当前一致时直接复用；否则用 openssl 重新生成。
+    # 注意：所有 hy2 入站共用同一张自签名证书，CN 将以最后一次 ensure_hy2_cert 的 SNI 为准，
+    # 客户端以 insecure=1 连接时不校验证书，因此多 SNI 场景仍可用。
+    if [ -f "$hy2_cert" ] && [ -f "$hy2_key" ] && [ "$current" = "$sni" ]; then
+        return 0
+    fi
     command_exists openssl || manage_packages install openssl >/dev/null 2>&1
     command_exists openssl || { red "需要 openssl 生成 Hysteria2 自签名证书，请先安装 openssl 后重试。"; return 1; }
     mkdir -p "$work_dir"
@@ -772,6 +792,8 @@ ensure_hy2_cert() {
     if [ -f "$hy2_cert" ] && [ -f "$hy2_key" ]; then
         chmod 600 "$hy2_key"
         chmod 644 "$hy2_cert"
+        printf '%s' "$sni" > "$hy2_sni_file"
+        chmod 600 "$hy2_sni_file"
         return 0
     fi
     red "生成 Hysteria2 自签名证书失败。"
@@ -1250,45 +1272,56 @@ apply_config() {
     restart_singbox || return 2
 }
 
-apply_config_or_remove() {
-    local file="$1" status
-    apply_config
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        rm -f "$file"
-        write_config >/dev/null 2>&1 || true
-        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
-        return 1
+# 尽力把 iptables/ip6tables 规则持久化，使其重启后仍生效。按常见机制优先级：
+#   - Debian/Ubuntu: netfilter-persistent（package 自带开机恢复）
+#   - RHEL/CentOS:   iptables.service，规则存 /etc/sysconfig/iptables
+#   - Alpine/OpenRC: iptables/ip6tables 服务，规则存 /etc/iptables/rules.v4|v6
+persist_iptables_rules() {
+    if command_exists netfilter-persistent; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+        return 0
     fi
-}
-
-apply_config_or_restore() {
-    local target="$1" backup="$2" status
-    apply_config
-    status=$?
-    if [ "$status" -ne 0 ]; then
-        if [ -f "$backup" ]; then
-            mv "$backup" "$target"
-        else
-            rm -f "$target"
-        fi
-        write_config >/dev/null 2>&1 || true
-        [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
-        return 1
+    if command_exists systemctl && { [ -f /usr/lib/systemd/system/iptables.service ] || [ -f /etc/systemd/system/iptables.service ]; }; then
+        mkdir -p /etc/sysconfig 2>/dev/null || true
+        iptables-save > /etc/sysconfig/iptables 2>/dev/null || true
+        ip6tables-save > /etc/sysconfig/ip6tables 2>/dev/null || true
+        systemctl enable iptables >/dev/null 2>&1 || true
+        systemctl enable ip6tables >/dev/null 2>&1 || true
+        return 0
     fi
-    rm -f "$backup"
+    if command_exists rc-update && command_exists rc-service; then
+        mkdir -p /etc/iptables 2>/dev/null || true
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        rc-update add iptables default >/dev/null 2>&1 || true
+        rc-update add ip6tables default >/dev/null 2>&1 || true
+        return 0
+    fi
+    yellow "未检测到可用的 iptables 持久化机制，防火墙规则将在重启后失效，请在需要时手动放行。"
+    return 1
 }
 
 allow_port() {
-    local port="$1" protocol="${2:-tcp}" proto_flag
+    local port="$1" protocol="${2:-tcp}" proto_flag touched_iptables=0
 
     yellow "尝试放行端口 ${port}（${protocol}）..."
     for proto_flag in $protocol; do
+        # ufw/firewalld 的规则本身即持久化（firewalld 用 --permanent + reload）
         command_exists ufw && ufw allow "${port}/${proto_flag}" >/dev/null 2>&1 || true
         command_exists firewall-cmd && firewall-cmd --permanent --add-port="${port}/${proto_flag}" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 || true
-        command_exists iptables && iptables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || iptables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || true
-        command_exists ip6tables && ip6tables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || ip6tables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || true
+        # iptables/ip6tables 规则不持久，需额外保存；仅当新增了规则才触发保存
+        if command_exists iptables; then
+            iptables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || {
+                iptables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null && touched_iptables=1
+            }
+        fi
+        if command_exists ip6tables; then
+            ip6tables -C INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null || {
+                ip6tables -I INPUT -p "$proto_flag" --dport "$port" -j ACCEPT 2>/dev/null && touched_iptables=1
+            }
+        fi
     done
+    [ "$touched_iptables" -eq 1 ] && persist_iptables_rules
 }
 
 write_systemd_service() {
@@ -1486,18 +1519,6 @@ user_is_visible() {
     return 0
 }
 
-# 收集可见入站用户名到全局数组 INBOUND_NAMES
-collect_inbound_names() {
-    local file
-    INBOUND_NAMES=()
-    for file in "$users_dir"/*.env; do
-        [ -f "$file" ] || continue
-        load_user_file "$file"
-        user_is_visible || continue
-        INBOUND_NAMES+=("$NAME")
-    done
-}
-
 # 收集落地 outbound tag（不含内置 direct/block）到全局数组 OUTBOUND_TAGS
 collect_outbound_tags() {
     local file
@@ -1507,21 +1528,6 @@ collect_outbound_tags() {
         load_outbound_file "$file" || continue
         [ -n "$TAG" ] && [ -n "$TYPE" ] || continue
         OUTBOUND_TAGS+=("$TAG")
-    done
-}
-
-# 打印带序号的入站列表（依赖 collect_inbound_names 已执行）
-list_inbounds_numbered() {
-    local i name
-    if [ "${#INBOUND_NAMES[@]}" -eq 0 ]; then
-        purple "（暂无入站）"
-        return 0
-    fi
-    green "\n=== 现有入站 ===\n"
-    for i in "${!INBOUND_NAMES[@]}"; do
-        name="${INBOUND_NAMES[$i]}"
-        load_user_file "$(user_file "$name")"
-        purple "$((i + 1))) ${NAME} | $(inbound_label "$INBOUND_TYPE") | port=${INBOUND_PORT} | outbound=${OUTBOUND_TAG}"
     done
 }
 
@@ -1695,7 +1701,8 @@ run_install_flow() {
     local uuid
     if [ -f "$state_file" ] && [ -x "${work_dir}/${server_name}" ]; then
         yellow "sing-box 已安装。"
-        migrate_legacy_state
+        # 状态文件存在但仍不完整（缺 UUID/密钥等）时不应静默生成“零入站”配置
+        migrate_legacy_state || { red "状态文件不完整，无法继续。请先清理后重新初始化，或手动核对 reality.env。"; return 1; }
         write_config || return 1
         allow_port "$PORT"
         install_service
@@ -2038,7 +2045,7 @@ bind_landing_to_group() {
 
 # 修改某个入站的 outbound 绑定（失败自动还原）
 change_user_outbound() {
-    local name="$1" new_outbound_tag="$2" file old_outbound_tag status sni
+    local name="$1" new_outbound_tag="$2" file old_outbound_tag status sni usr
     file=$(user_file "$name")
     [ -f "$file" ] || { red "入站不存在：$name"; return 1; }
     outbound_exists "$new_outbound_tag" || { red "落地不存在：$new_outbound_tag"; return 1; }
@@ -2046,12 +2053,13 @@ change_user_outbound() {
     old_outbound_tag="$OUTBOUND_TAG"
     [ "$old_outbound_tag" = "$new_outbound_tag" ] && { yellow "绑定未变化。"; return 0; }
     sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
-    save_user "$name" "$UUID" "$new_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+    usr="$USERNAME"
+    save_user "$name" "$UUID" "$new_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr"
     apply_config
     status=$?
     if [ "$status" -ne 0 ]; then
         sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
-        save_user "$name" "$UUID" "$old_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni"
+        save_user "$name" "$UUID" "$old_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr"
         write_config >/dev/null 2>&1 || true
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
@@ -2090,7 +2098,7 @@ delete_user() {
 
 # 修改入站端口（组级：同协议同端口整组迁移）；Reality 走 change_port（主端口）
 change_inbound_port_group() {
-    local type="$1" old_port="$2" new_port status members name backup_dir f u o fl i pw m sn
+    local type="$1" old_port="$2" new_port status members name backup_dir f u o fl i pw m sn un
     if [ "$type" = "vless-reality" ]; then
         change_port
         return
@@ -2119,7 +2127,8 @@ change_inbound_port_group() {
         pw=$(read_env_value "$f" PASSWORD || true)
         m=$(read_env_value "$f" METHOD || true)
         sn=$(read_env_value "$f" H2_SNI || true)
-        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$new_port" "$sn"
+        un=$(read_env_value "$f" USERNAME || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$new_port" "$sn" "$un"
     done
 
     apply_config
@@ -2382,7 +2391,8 @@ list_node_links() {
 
 # 单个入站分组的子菜单（循环直到返回）
 manage_group_menu() {
-    local type="$1" port="$2" sub members m
+    local type="$1" port="$2" sub members m n
+    local add_opt chgport_opt chgsni_opt chgpw_opt chgbind_opt del_opt delgrp_opt
     while :; do
         members=$(group_member_names "$type" "$port")
         clear_screen
@@ -2392,22 +2402,36 @@ manage_group_menu() {
             purple "  ${NAME} -> ${OUTBOUND_TAG}"
         done
         purple ""
-        green "1. 添加用户"
-        green "2. 修改端口"
-        [ "$type" = "hysteria2" ] && green "3. 修改 SNI"
-        green "4. 编辑用户出站"
-        green "5. 删除用户"
-        green "6. 删除入站（连同所有用户）"
+        n=0
+        n=$((n + 1)); add_opt=$n;     green "${add_opt}. 添加用户"
+        n=$((n + 1)); chgport_opt=$n; green "${chgport_opt}. 修改端口"
+        chgsni_opt=0
+        [ "$type" = "hysteria2" ] && { n=$((n + 1)); chgsni_opt=$n; green "${chgsni_opt}. 修改 SNI"; }
+        chgpw_opt=0
+        if [ "$type" = "shadowsocks" ] || [ "$type" = "hysteria2" ]; then
+            n=$((n + 1)); chgpw_opt=$n; green "${chgpw_opt}. 修改密码"
+        fi
+        n=$((n + 1)); chgbind_opt=$n; green "${chgbind_opt}. 编辑用户出站"
+        n=$((n + 1)); del_opt=$n;     green "${del_opt}. 删除用户"
+        n=$((n + 1)); delgrp_opt=$n;  green "${delgrp_opt}. 删除入站（连同所有用户）"
         purple "0. 返回"
         reading "请输入选择: " sub
         case "$sub" in
             0) return ;;
-            1) add_user_to_inbound "$type" "$port" ;;
-            2) change_inbound_port_group "$type" "$port" ;;
-            3) [ "$type" = "hysteria2" ] && change_inbound_sni_group "$type" "$port" || red "无效的选项" ;;
-            4) pick_group_member "$type" "$port" && change_user_outbound_menu "$GROUP_MEMBER" ;;
-            5) pick_group_member "$type" "$port" && delete_user "$GROUP_MEMBER" ;;
-            6) delete_inbound_group "$type" "$port" && return ;;
+            "$add_opt") add_user_to_inbound "$type" "$port" ;;
+            "$chgport_opt") change_inbound_port_group "$type" "$port" ;;
+            "$chgsni_opt") change_inbound_sni_group "$type" "$port" ;;
+            "$chgpw_opt")
+                if [ "$type" = "shadowsocks" ]; then
+                    # SS 为单用户入站，直接改该用户密码
+                    change_inbound_password "$members"
+                else
+                    pick_group_member "$type" "$port" && change_inbound_password "$GROUP_MEMBER"
+                fi
+                ;;
+            "$chgbind_opt") pick_group_member "$type" "$port" && change_user_outbound_menu "$GROUP_MEMBER" ;;
+            "$del_opt") pick_group_member "$type" "$port" && delete_user "$GROUP_MEMBER" ;;
+            "$delgrp_opt") delete_inbound_group "$type" "$port" && return ;;
             *) red "无效的选项" ;;
         esac
         [ "$sub" != "0" ] && { read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'; echo ""; }
@@ -2819,7 +2843,7 @@ install_realm() {
     yellow "下载 realm v${latest} (${target})..."
     if ! curl -fL --retry 3 -o "$tmp_dir/realm.tar.gz" "$dl_url"; then
         case "$target" in
-            *-gnu)      target="${target%-gnu}-unknown-linux-musl" ;;
+            *-gnu)      target="${target%-unknown-linux-gnu}-unknown-linux-musl" ;;
             *-musleabihf) target="${target%-unknown-linux-musleabihf}-unknown-linux-gnu" ;;
             *-musl)     target="${target%-unknown-linux-musl}-unknown-linux-gnu" ;;
         esac
@@ -2960,6 +2984,7 @@ uninstall_realm_service() {
     fi
     stop_realm_direct
     rm -rf "$realm_work" 2>/dev/null || true
+    rm -f "$realm_bin" 2>/dev/null || true
 }
 
 add_forward() {

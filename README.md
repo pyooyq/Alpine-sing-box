@@ -76,7 +76,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持：安装/初始化节点、添加落地、列出节点链接、入站管理（增/删/改入站与用户）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载。
+菜单支持：安装/初始化节点、添加落地、列出节点链接、入站管理（增/删/改入站与用户；SS/HY2 可在入站管理里改密码）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载。
 
 ## 使用方式
 
@@ -127,4 +127,5 @@ sb
 - 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/`、`/etc/sing-box/outbounds.d/` 和 `/etc/sing-box/forwards.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
 - `-port` 指定的是 Reality 主入站端口；添加落地时若没有任何入站，会自动创建使用该端口的 Reality 用户
-- 守护：只要未手动“停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC respawn 包装器）；手动停止后不会复活
+- 入站端口会在防火墙自动放行：ufw / firewalld 规则本身持久化；iptables/ip6tables 在有持久化机制（netfilter-persistent / iptables.service / OpenRC iptables）时自动保存并开机恢复，无可用机制时提示需手动放行
+- 守护：只要未手动”停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC respawn 包装器）；手动停止后不会复活
