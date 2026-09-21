@@ -1449,22 +1449,101 @@ stop_singbox() {
     fi
 }
 
-get_server_ip() {
+# 探测主地址并缓存到全局 SERVER_IP_CACHE（IPv4 优先，无 v4 出口时回退带方括号 IPv6）。
+# 注意：命令替换 $(get_server_ip) 在子 shell 中执行，函数内的赋值不会留在父进程；
+# 需要利用缓存的长流程请在主 shell 直接调用 load_server_ip 后读取 $SERVER_IP_CACHE。
+load_server_ip() {
     local ip
+    [ -n "${SERVER_IP_CACHE:-}" ] && return 0
 
     ip=$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null || true)
     if [ -n "$ip" ]; then
-        echo "$ip"
-        return
+        SERVER_IP_CACHE="$ip"
+        return 0
     fi
 
     ip=$(curl -6 -fsS --max-time 3 https://api64.ipify.org 2>/dev/null || true)
     if [ -n "$ip" ]; then
-        echo "[${ip}]"
-        return
+        SERVER_IP_CACHE="[${ip}]"
+        return 0
     fi
 
-    echo "你的服务器IP"
+    SERVER_IP_CACHE="你的服务器IP"
+    return 0
+}
+
+get_server_ip() {
+    load_server_ip
+    printf '%s' "$SERVER_IP_CACHE"
+}
+
+# 探测公网 IPv6（裸地址，不带方括号）；无公网 IPv6 时输出空串。
+# 优先取本机网卡全局单播地址（排除 fe80 链路本地与 fc/fd ULA 私有段），
+# 网卡信息不可见（NAT 容器等）时用 IPv6 出口探测兜底。
+# 结果缓存于全局 SERVER_IPV6_CACHE（"-" 表示已检测且无公网 IPv6）；
+# 同 load_server_ip，需在主 shell 直接调用 load_public_ipv6 才能吃到缓存，
+# 主菜单每轮操作开始时会清空缓存。
+load_public_ipv6() {
+    local addr=""
+    [ -n "${SERVER_IPV6_CACHE:-}" ] && return 0
+
+    # 1) 本机网卡：ip -6 全局作用域地址（2000::/3 公网单播，即 2/3 开头）
+    if command_exists ip; then
+        addr=$(ip -6 addr show scope global 2>/dev/null \
+            | awk '$1 == "inet6" && $0 !~ /deprecated/ { print $2 }' \
+            | cut -d/ -f1 \
+            | grep -E '^[23][0-9a-fA-F]*:' \
+            | grep -vE '^(fc|fd)' \
+            | head -n 1)
+    fi
+
+    # 2) 本机网卡：ifconfig 兜底（busybox/net-tools 格式均可）
+    if [ -z "$addr" ] && command_exists ifconfig; then
+        addr=$(ifconfig -a 2>/dev/null \
+            | tr ' ' '\n' \
+            | sed 's#/[0-9]*$##' \
+            | grep -E '^[23][0-9a-fA-F]*:' \
+            | grep -vE '^(fc|fd)' \
+            | head -n 1)
+    fi
+
+    # 3) IPv6 出口探测（网卡不可见时兜底；无 IPv6 路由时静默失败）
+    if [ -z "$addr" ]; then
+        addr=$(curl -6 -fsS --max-time 3 https://api64.ipify.org 2>/dev/null || true)
+    fi
+
+    # 统一清洗：去方括号/zone 后校验形如 IPv6
+    addr="${addr#[}"
+    addr="${addr%]}"
+    addr="${addr%%%*}"
+    if [[ "$addr" == *:* ]] && [[ "$addr" =~ ^[0-9a-fA-F:]+$ ]]; then
+        SERVER_IPV6_CACHE="$addr"
+        return 0
+    fi
+
+    SERVER_IPV6_CACHE="-"
+    return 0
+}
+
+get_public_ipv6() {
+    load_public_ipv6
+    [ "$SERVER_IPV6_CACHE" != "-" ] && printf '%s' "$SERVER_IPV6_CACHE"
+    return 0
+}
+
+# 打印一个用户的节点链接：先输出主地址（IPv4 优先）链接，
+# 检测到公网 IPv6 时额外输出一条 [IPv6] 链接（主地址已是 IPv6 时不重复）。
+# 本函数在主 shell 直接调用（非 $(...)），多次调用间共享地址探测缓存。
+# 参数与 user_link 第 1-3、5-10 个参数一一对应（不含 server_ip）。
+print_user_links() {
+    local uuid="$1" name="$2" flow="$3" inbound_type="${4:-$default_inbound_type}" password="${5:-}" method="${6:-$default_ss_method}" inbound_port="${7:-$PORT}" sni="${8:-}" username="${9:-}"
+    load_server_ip
+    load_public_ipv6
+    purple "$(user_link "$uuid" "$name" "$flow" "$SERVER_IP_CACHE" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username")"
+    if [[ "$SERVER_IP_CACHE" != *:* ]] && [ "$SERVER_IPV6_CACHE" != "-" ]; then
+        purple "$(user_link "$uuid" "$name" "$flow" "[${SERVER_IPV6_CACHE}]" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username")"
+    fi
+    purple ""
 }
 
 user_link() {
@@ -1587,11 +1666,13 @@ show_reality_info() {
     require_reality_state || return 1
 
     load_state
-    local file link server_ip
-    server_ip=$(get_server_ip)
+    local file
+    load_server_ip
+    load_public_ipv6
 
     green "\n节点参数："
-    purple "地址: ${server_ip}"
+    purple "地址(IPv4): ${SERVER_IP_CACHE}"
+    [ "$SERVER_IPV6_CACHE" != "-" ] && purple "地址(IPv6): ${SERVER_IPV6_CACHE}"
     purple "端口: ${PORT}"
     purple "Reality SNI/伪装域名: ${REALITY_DOMAIN}"
     purple "Reality PublicKey: ${PUBLIC_KEY}"
@@ -1604,9 +1685,8 @@ show_reality_info() {
         [ -f "$file" ] || continue
         load_user_file "$file"
         [ -n "$NAME" ] || continue
-        link=$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")
         purple "${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}"
-        purple "$link\n"
+        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
     done
 }
 
@@ -1941,7 +2021,7 @@ create_bound_user_for_outbound() {
 
     allow_port "$SELECTED_INBOUND_PORT"
     green "已添加落地并自动绑定用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    purple "$(user_link "$uuid" "$name" "$default_flow" "$(get_server_ip)" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "")\n"
+    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" ""
 }
 
 add_inbound() {
@@ -1995,7 +2075,7 @@ add_inbound() {
     else
         green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
     fi
-    purple "$(user_link "$uuid" "$name" "$default_flow" "$(get_server_ip)" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "$SELECTED_INBOUND_USERNAME")\n"
+    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "$SELECTED_INBOUND_USERNAME"
 }
 
 # 把已导入的落地绑定为指定入站分组上的【新用户】（自动生成凭据，不覆盖现有用户）
@@ -2345,7 +2425,7 @@ add_user_to_inbound() {
     allow_port "$port"
     green "已添加用户：${name} -> ${outbound_tag} ($(group_label "$type" "$port"))"
     load_user_file "$(user_file "$name")"
-    purple "$(user_link "$UUID" "$NAME" "$FLOW" "$(get_server_ip)" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")\n"
+    print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
 }
 
 # 删除整个入站分组（连同其所有用户；失败自动还原；保留至少一个用户保护）
@@ -2374,9 +2454,9 @@ delete_inbound_group() {
 }
 
 # 主菜单"列出节点链接"：遍历所有可见用户，打印其类型/端口/出站与标准代理链接
+# （检测到公网 IPv6 时，每个用户同时输出 IPv4 与 IPv6 两条链接）
 list_node_links() {
-    local file found=0 server_ip
-    server_ip=$(get_server_ip)
+    local file found=0
     green "\n=== 全部节点链接 ===\n"
     for file in "$users_dir"/*.env; do
         [ -f "$file" ] || continue
@@ -2384,7 +2464,7 @@ list_node_links() {
         user_is_visible || continue
         found=1
         green "${NAME} ($(inbound_label "$INBOUND_TYPE"), port=${INBOUND_PORT}) -> ${OUTBOUND_TAG}"
-        purple "$(user_link "$UUID" "$NAME" "$FLOW" "$server_ip" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME")\n"
+        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
     done
     [ "$found" -eq 1 ] || yellow "（暂无可见节点）"
 }
@@ -2867,8 +2947,26 @@ require_realm() {
     return 0
 }
 
+# realm 转发监听地址：有公网 IPv6 且系统为默认双栈（bindv6only=0）时
+# 监听 :: 同时覆盖 IPv4/IPv6 客户端，否则保持 0.0.0.0（仅 IPv4）。
+# 读取 /proc 而非依赖 sysctl 命令；bindv6only 非 0 时 :: 仅收 v6，会漏掉 v4 流量，故退回 v4。
+realm_listen_host() {
+    local host6 v6only=""
+    # 本函数常在 $(...) 子 shell 中被调用，这里单次探测即可（不依赖跨子 shell 缓存）
+    host6=$(get_public_ipv6)
+    if [ -n "$host6" ] && [ -r /proc/sys/net/ipv6/bindv6only ]; then
+        v6only=$(trim "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null)")
+        if [ "$v6only" = "0" ]; then
+            printf '::'
+            return 0
+        fi
+    fi
+    printf '0.0.0.0'
+}
+
 write_realm_config() {
-    local file first=1 tag protocol local_port target_addr target_port no_tcp use_udp remote
+    local file first=1 tag protocol local_port target_addr target_port no_tcp use_udp remote listen_host
+    listen_host=$(realm_listen_host)
     mkdir -p "$realm_work"
     {
         printf '{\n  "log": { "level": "warn" },\n  "endpoints": [\n'
@@ -2889,7 +2987,12 @@ write_realm_config() {
             case " $protocol " in *tcp*) no_tcp=false ;; *) no_tcp=true ;; esac
             case " $protocol " in *udp*) use_udp=true ;; *) use_udp=false ;; esac
             printf '    {\n'
-            printf '      "listen": %s,\n' "$(json_string "0.0.0.0:${local_port}")"
+            # realm 的 listen 为 host:port 形式：IPv6 主机需加方括号（[::]:port），与 remote 侧一致
+            if [[ "$listen_host" == *:* ]]; then
+                printf '      "listen": %s,\n' "$(json_string "[${listen_host}]:${local_port}")"
+            else
+                printf '      "listen": %s,\n' "$(json_string "${listen_host}:${local_port}")"
+            fi
             printf '      "remote": %s,\n' "$(json_string "$remote")"
             printf '      "network": { "no_tcp": %s, "use_udp": %s }\n' "$no_tcp" "$use_udp"
             printf '    }'
@@ -3229,6 +3332,8 @@ fi
 ensure_shortcut
 
 while true; do
+    # 每轮菜单操作重新探测出口/IPv6 地址（同一轮操作内多用户共享缓存结果）
+    unset SERVER_IP_CACHE SERVER_IPV6_CACHE
     menu
     case "$choice" in
         1) run_install_flow ;;

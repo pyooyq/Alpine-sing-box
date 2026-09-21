@@ -22,6 +22,7 @@
 - Shadowsocks 暂为单用户独立端口（一端口多用户需 `2022-blake3-*` 加密与 master key，暂未开放）
 - sing-box 守护：进程被杀自动重启；用户手动“停止”时不复活（systemd 用 `Restart=always`，OpenRC 用 shell 包装器循环 respawn）
 - 主菜单“列出节点链接”统一列出所有入站的连接链接（协议、端口、出站）
+- 支持 IPv6：入站默认双栈监听（`::`，v4/v6 客户端均可连）；检测到公网 IPv6 时节点链接会同时输出 IPv4 与 `[IPv6]` 两条链接，realm 转发也以 `[::]` 双栈监听；无公网 IPv6（仅 ULA/链路本地或无 v6 路由）时行为与之前完全一致
 - 支持 TCP/UDP 纯转发：基于用户态 realm 转发，不处理协议，客户端无需任何配置，支持 tcp、udp 或两者，无需 iptables（可在无 iptables / 无特权容器环境工作）
 - 不支持导入 VLESS Reality 落地
 - 不安装 nginx
@@ -128,4 +129,6 @@ sb
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
 - `-port` 指定的是 Reality 主入站端口；添加落地时若没有任何入站，会自动创建使用该端口的 Reality 用户
 - 入站端口会在防火墙自动放行：ufw / firewalld 规则本身持久化；iptables/ip6tables 在有持久化机制（netfilter-persistent / iptables.service / OpenRC iptables）时自动保存并开机恢复，无可用机制时提示需手动放行
+- IPv6 检测顺序：本机网卡全局单播地址（`ip -6` / `ifconfig`，排除 fe80 链路本地与 fc/fd 私有段）→ IPv6 出口探测（`curl -6`）兜底；检测结果仅用于生成节点链接与 realm 监听地址，每次菜单操作重新探测一次
+- realm 转发仅在“有公网 IPv6 且 `net.ipv6.bindv6only=0`（Linux 默认）”时监听 `[::]` 双栈，否则保持 `0.0.0.0`；已部署的转发规则在下次增删/重载时自动应用新监听地址
 - 守护：只要未手动”停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC respawn 包装器）；手动停止后不会复活
