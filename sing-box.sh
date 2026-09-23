@@ -136,6 +136,15 @@ json_escape() {
     value=${value//$'\n'/\\n}
     value=${value//$'\r'/}
     value=${value//$'\t'/\\t}
+    # 其余控制字符（\x00-\x1f）无法出现在 JSON 字符串中，直接剔除（正常凭据不会包含）
+    if [[ "$value" == *[[:cntrl:]]* ]]; then
+        local out="" i c
+        for ((i = 0; i < ${#value}; i++)); do
+            c="${value:i:1}"
+            [[ "$c" == [[:cntrl:]] ]] || out="${out}${c}"
+        done
+        value="$out"
+    fi
     printf '%s' "$value"
 }
 
@@ -326,6 +335,7 @@ load_state() {
     PRIVATE_KEY=$(read_env_value "$state_file" PRIVATE_KEY || true)
     PUBLIC_KEY=$(read_env_value "$state_file" PUBLIC_KEY || true)
     SHORT_ID=$(read_env_value "$state_file" SHORT_ID || true)
+    EXTERNAL_ADDR=$(read_env_value "$state_file" EXTERNAL_ADDR || true)
 }
 
 save_state() {
@@ -336,6 +346,7 @@ save_state() {
         write_env_line PRIVATE_KEY "${PRIVATE_KEY:-}"
         write_env_line PUBLIC_KEY "${PUBLIC_KEY:-}"
         write_env_line SHORT_ID "${SHORT_ID:-}"
+        write_env_line EXTERNAL_ADDR "${EXTERNAL_ADDR:-}"
     } > "$state_file"
     chmod 600 "$state_file"
 }
@@ -394,6 +405,41 @@ inbound_port_in_use() {
     return 1
 }
 
+# 端口是否已被本机其他进程真实监听（ss 优先，netstat 兜底；均不可用时视为未占用）。
+# state 文件检查不到外来进程占用的端口，sing-box check 也不试绑定，缺了这层会出现
+# "重启后 sing-box 绑定失败 -> OpenRC wrapper 3 秒无限重启" 的静默故障。
+port_socket_in_use() {
+    local port="$1" proto="${2:-tcp}" flag="-ltn"
+    # 只查请求协议对应的监听栈：hy2 仅绑 UDP，同端口号的 TCP 监听不构成冲突，反之亦然
+    [ "$proto" = "udp" ] && flag="-lun"
+    if command_exists ss; then
+        ss $flag 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "[:.]${port}$" && return 0
+        return 1
+    fi
+    if command_exists netstat; then
+        netstat $flag 2>/dev/null | awk 'NR>1 {print $4}' | grep -qE "[:.]${port}$" && return 0
+        return 1
+    fi
+    return 1
+}
+
+# 是否已存在某协议+端口的入站分组（用于端口 socket 占用时的“加入已有入站”豁免）
+inbound_group_exists() {
+    local wanted_type="$1" port="$2" file
+    if [ "$wanted_type" = "vless-reality" ]; then
+        has_inbound_type "vless-reality"
+        return $?
+    fi
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        [ "$INBOUND_TYPE" = "$wanted_type" ] || continue
+        [ "$INBOUND_PORT" = "$port" ] || continue
+        return 0
+    done
+    return 1
+}
+
 validate_new_outbound_tag() {
     local tag="$1"
     [ -n "$tag" ] || { red "tag 不能为空"; return 1; }
@@ -414,7 +460,7 @@ load_user_file() {
     esac
     # 保证 Reality 用户端口解析前 PORT 已加载（避免在 load_state 之前调用时的空端口）
     [ -n "$PORT" ] || load_state
-    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD H2_SNI USERNAME
+    unset NAME UUID FLOW OUTBOUND_TAG INBOUND_TYPE INBOUND_PORT METHOD PASSWORD H2_SNI USERNAME EXTERNAL_PORT
     NAME=$(read_env_value "$file" NAME || true)
     UUID=$(read_env_value "$file" UUID || true)
     FLOW=$(read_env_value "$file" FLOW || true)
@@ -425,6 +471,7 @@ load_user_file() {
     PASSWORD=$(read_env_value "$file" PASSWORD || true)
     H2_SNI=$(read_env_value "$file" H2_SNI || true)
     USERNAME=$(read_env_value "$file" USERNAME || true)
+    EXTERNAL_PORT=$(read_env_value "$file" EXTERNAL_PORT || true)
     FLOW="${FLOW:-$default_flow}"
     OUTBOUND_TAG="${OUTBOUND_TAG:-$direct_outbound_tag}"
     INBOUND_TYPE="${INBOUND_TYPE:-$default_inbound_type}"
@@ -479,7 +526,7 @@ load_outbound_file() {
 }
 
 save_user() {
-    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" file
+    local name="$1" uuid="$2" outbound_tag="$3" flow="${4:-$default_flow}" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" external_port="${11:-}" file
     name=$(sanitize_tag "$name")
     file=$(user_file "$name")
     {
@@ -493,6 +540,8 @@ save_user() {
         write_env_line PASSWORD "$password"
         [ -n "$sni" ] && write_env_line H2_SNI "$sni"
         [ -n "$username" ] && write_env_line USERNAME "$username"
+        # NAT 外部映射端口：仅影响节点链接展示，不影响实际监听
+        [ -n "$external_port" ] && write_env_line EXTERNAL_PORT "$external_port"
     } > "$file"
     chmod 600 "$file"
 }
@@ -615,17 +664,18 @@ validate_config_file() {
 }
 
 check_singbox() {
+    # 输出总被 $(...) 捕获后嵌入其他着色行，此处输出纯文本避免 ANSI 码嵌套错乱
     if [ ! -x "${work_dir}/${server_name}" ] && [ ! -f /etc/systemd/system/sing-box.service ] && [ ! -f /etc/init.d/sing-box ]; then
-        red "not installed"
+        echo "not installed"
         return 2
     fi
 
     if command_exists rc-service; then
-        rc-service sing-box status 2>/dev/null | grep -q "started" && green "running" || yellow "not running"
+        rc-service sing-box status 2>/dev/null | grep -q "started" && echo "running" || echo "not running"
     elif command_exists systemctl; then
-        systemctl is-active sing-box 2>/dev/null | grep -q "^active$" && green "running" || yellow "not running"
+        systemctl is-active sing-box 2>/dev/null | grep -q "^active$" && echo "running" || echo "not running"
     else
-        yellow "unknown"
+        echo "unknown"
     fi
 }
 
@@ -694,7 +744,13 @@ install_singbox_from_package() {
 
     yellow "未发现可用的本机 sing-box，尝试通过 apk 安装 sing-box..."
     apk add --no-cache sing-box || apk add --no-cache sing-box-openrc || return 1
-    use_existing_singbox
+    use_existing_singbox || return 1
+    # 二进制已复制进 ${work_dir}，卸载 apk 包回收约 30MB 磁盘（小磁盘 VPS 友好），
+    # 服务文件由 install_service 随后自行写入，不依赖 apk 的 openrc 脚本
+    if apk del sing-box sing-box-openrc >/dev/null 2>&1; then
+        yellow "已回收 apk 安装的 sing-box 包（二进制保留在 ${work_dir}/${server_name}）"
+    fi
+    return 0
 }
 
 detect_arch() {
@@ -720,14 +776,16 @@ install_singbox_binary() {
     mkdir -p "$work_dir"
     chmod 755 "$work_dir"
 
-    latest_version=$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)
+    latest_version=$(curl -fsSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)
     [ -n "$latest_version" ] || { red "获取 sing-box 最新版本失败"; exit 1; }
 
     archive="${work_dir}/sing-box-${latest_version}-linux-${arch}.tar.gz"
-    tmp_dir=$(mktemp -d)
+    # 下载/解压临时目录放在磁盘（work_dir）而非 /tmp —— 部分 Alpine 容器把 /tmp 挂成
+    # tmpfs（吃内存），30MB 压缩包在 64MB 内存机器上可能直接 OOM
+    tmp_dir=$(mktemp -d "${work_dir}/.dl.XXXXXX")
 
     yellow "下载 sing-box v${latest_version}..."
-    curl -fL --retry 3 -o "$archive" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${arch}.tar.gz" || {
+    curl -fL --retry 3 --connect-timeout 10 --max-time 300 -o "$archive" "https://github.com/SagerNet/sing-box/releases/download/v${latest_version}/sing-box-${latest_version}-linux-${arch}.tar.gz" || {
         rm -rf "$tmp_dir" "$archive"
         red "下载 sing-box 失败"
         exit 1
@@ -1094,7 +1152,7 @@ EOF
 }
 
 render_outbound_json() {
-    local file first=0 tag type display server server_port username password method plugin plugin_opts
+    local file tag type display server server_port username password method plugin plugin_opts
     printf '    {\n      "type": "direct",\n      "tag": %s\n    },\n' "$(json_string "$direct_outbound_tag")"
     printf '    {\n      "type": "block",\n      "tag": %s\n    }' "$(json_string "$block_outbound_tag")"
 
@@ -1239,7 +1297,7 @@ write_config() {
     cat > "$tmp_config" << EOF
 {
   "log": {
-    "level": "warn",
+    "level": "error",
     "output": "${work_dir}/sing-box.log",
     "timestamp": true
   },
@@ -1324,7 +1382,46 @@ allow_port() {
     [ "$touched_iptables" -eq 1 ] && persist_iptables_rules
 }
 
+# 按入站协议放行端口：Hysteria2 是 QUIC/UDP，其余为 TCP。
+# 之前统一只放 TCP，导致有防火墙的机器上 hy2 节点完全不通。
+allow_inbound_port() {
+    local inbound_type="$1" port="$2"
+    case "$inbound_type" in
+        hysteria2) allow_port "$port" "udp" ;;
+        *)         allow_port "$port" "tcp" ;;
+    esac
+}
+
+# 小内存 VPS（64-128MB 常见）为 Go 运行时给出软内存上限建议（GOMEMLIMIT），
+# 防止 Go 堆无限增长触发 OOM-kill；大内存机器不设置。返回空串表示不限制。
+# 内存大小优先取 cgroup 上限：无 lxcfs 的 NAT/LXC 容器里 /proc/meminfo 是宿主机内存，会误判为大内存。
+suggest_gomemlimit() {
+    local total_mb=""
+    # cgroup v2：未限制时值为 "max"
+    if [ -r /sys/fs/cgroup/memory.max ]; then
+        total_mb=$(awk '{ if ($1 != "max") printf "%d", $1/1048576 }' /sys/fs/cgroup/memory.max 2>/dev/null)
+    fi
+    # cgroup v1：未限制时是一个极大值，超过 1TiB 视为未限制
+    if [ -z "$total_mb" ] && [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+        total_mb=$(awk '{ if ($1+0 > 0 && $1 < 1099511627776) printf "%d", $1/1048576 }' /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null)
+    fi
+    # 物理机 / KVM / 有 lxcfs 的容器
+    if [ -z "$total_mb" ] && [ -r /proc/meminfo ]; then
+        total_mb=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    fi
+    [ -n "$total_mb" ] || return 0
+    if [ "$total_mb" -le 96 ]; then
+        printf '32MiB'
+    elif [ "$total_mb" -le 192 ]; then
+        printf '64MiB'
+    fi
+    return 0
+}
+
 write_systemd_service() {
+    local gomemlimit env_line=""
+    gomemlimit=$(suggest_gomemlimit)
+    [ -n "$gomemlimit" ] && env_line="Environment=GOMEMLIMIT=${gomemlimit}"
     cat > /etc/systemd/system/sing-box.service << EOF
 [Unit]
 Description=sing-box service
@@ -1334,6 +1431,7 @@ After=network.target nss-lookup.target
 [Service]
 User=root
 WorkingDirectory=${work_dir}
+${env_line}
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=${work_dir}/${server_name} run -c ${config_dir}
@@ -1353,11 +1451,15 @@ EOF
 write_openrc_service() {
     # 守护：给 sing-box 套一个 shell 包装器循环。子进程退出/被杀则重启；
     # `rc-service sing-box stop` 时清理子进程并退出，不复活。不依赖 supervise-daemon，纯 OpenRC 生效。
+    local gomemlimit memlimit_line=""
+    gomemlimit=$(suggest_gomemlimit)
+    [ -n "$gomemlimit" ] && memlimit_line="GOMEMLIMIT=${gomemlimit}; export GOMEMLIMIT  # 小内存机软内存上限，防 OOM"
     cat > "${work_dir}/singbox-wrapper.sh" << EOF
 #!/bin/sh
 # sing-box 守护包装器：子进程退出/被杀则重启；rc-service stop 时清理子进程并退出
 BIN="${work_dir}/${server_name}"
 CONF="${config_dir}"
+${memlimit_line}
 child=""
 cleanup() {
     [ -n "\$child" ] && kill "\$child" 2>/dev/null || true
@@ -1400,6 +1502,11 @@ install_service() {
 }
 
 install_logrotate() {
+    # Alpine 默认镜像没有 logrotate（/etc/logrotate.d 不存在），直接 return 会导致日志
+    # 无限增长写爆小磁盘；装上 logrotate 包（约 200KB，自带 /etc/periodic/daily 定时入口）
+    if [ ! -d /etc/logrotate.d ] && command_exists apk; then
+        apk add --no-cache logrotate >/dev/null 2>&1 || true
+    fi
     [ -d /etc/logrotate.d ] || return 0
     cat > /etc/logrotate.d/sing-box << EOF
 ${work_dir}/sing-box.log {
@@ -1534,42 +1641,51 @@ get_public_ipv6() {
 # 打印一个用户的节点链接：先输出主地址（IPv4 优先）链接，
 # 检测到公网 IPv6 时额外输出一条 [IPv6] 链接（主地址已是 IPv6 时不重复）。
 # 本函数在主 shell 直接调用（非 $(...)），多次调用间共享地址探测缓存。
-# 参数与 user_link 第 1-3、5-10 个参数一一对应（不含 server_ip）。
+# 参数与 user_link 第 1-3、5-11 个参数一一对应（不含 server_ip）。
+# 设置了 EXTERNAL_ADDR（NAT 外部映射地址）时仅输出一条链接，忽略本机探测地址。
 print_user_links() {
-    local uuid="$1" name="$2" flow="$3" inbound_type="${4:-$default_inbound_type}" password="${5:-}" method="${6:-$default_ss_method}" inbound_port="${7:-$PORT}" sni="${8:-}" username="${9:-}"
+    local uuid="$1" name="$2" flow="$3" inbound_type="${4:-$default_inbound_type}" password="${5:-}" method="${6:-$default_ss_method}" inbound_port="${7:-$PORT}" sni="${8:-}" username="${9:-}" external_port="${10:-}"
+    load_state
+    if [ -n "${EXTERNAL_ADDR:-}" ]; then
+        purple "$(user_link "$uuid" "$name" "$flow" "$EXTERNAL_ADDR" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username" "$external_port")"
+        purple ""
+        return 0
+    fi
     load_server_ip
     load_public_ipv6
-    purple "$(user_link "$uuid" "$name" "$flow" "$SERVER_IP_CACHE" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username")"
+    purple "$(user_link "$uuid" "$name" "$flow" "$SERVER_IP_CACHE" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username" "$external_port")"
     if [[ "$SERVER_IP_CACHE" != *:* ]] && [ "$SERVER_IPV6_CACHE" != "-" ]; then
-        purple "$(user_link "$uuid" "$name" "$flow" "[${SERVER_IPV6_CACHE}]" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username")"
+        purple "$(user_link "$uuid" "$name" "$flow" "[${SERVER_IPV6_CACHE}]" "$inbound_type" "$password" "$method" "$inbound_port" "$sni" "$username" "$external_port")"
     fi
     purple ""
 }
 
 user_link() {
-    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" link userinfo
+    local uuid="$1" name="$2" flow="$3" server_ip="$4" inbound_type="${5:-$default_inbound_type}" password="${6:-}" method="${7:-$default_ss_method}" inbound_port="${8:-$PORT}" sni="${9:-}" username="${10:-}" external_port="${11:-}" link userinfo link_port
     load_state
     [ -n "$server_ip" ] || server_ip=$(get_server_ip)
     [ -n "$sni" ] || sni="$REALITY_DOMAIN"
+    # NAT 外部映射端口优先于本机监听端口（仅影响链接展示，不影响实际监听）
+    link_port="${external_port:-$inbound_port}"
     case "$inbound_type" in
         vless)
-            link="vless://${uuid}@${server_ip}:${inbound_port}?encryption=none&security=none&type=tcp&headerType=none#${name}"
+            link="vless://${uuid}@${server_ip}:${link_port}?encryption=none&security=none&type=tcp&headerType=none#${name}"
             ;;
         shadowsocks)
             userinfo=$(printf '%s:%s' "$method" "$password" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=')
-            link="ss://${userinfo}@${server_ip}:${inbound_port}#${name}"
+            link="ss://${userinfo}@${server_ip}:${link_port}#${name}"
             ;;
         hysteria2)
-            link="hysteria2://$(url_encode "$password")@${server_ip}:${inbound_port}?sni=${sni}&insecure=1#${name}"
+            link="hysteria2://$(url_encode "$password")@${server_ip}:${link_port}?sni=${sni}&insecure=1#${name}"
             ;;
         http)
-            link="http://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${inbound_port}#${name}"
+            link="http://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${link_port}#${name}"
             ;;
         socks)
-            link="socks5://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${inbound_port}#${name}"
+            link="socks5://$(url_encode "${username:-$name}"):$(url_encode "$password")@${server_ip}:${link_port}#${name}"
             ;;
         *)
-            link="vless://${uuid}@${server_ip}:${PORT}?encryption=none&flow=${flow:-$default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
+            link="vless://${uuid}@${server_ip}:${link_port}?encryption=none&flow=${flow:-$default_flow}&security=reality&sni=${REALITY_DOMAIN}&fp=${default_fingerprint}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&headerType=none#${name}"
             ;;
     esac
     printf '%s' "$link"
@@ -1678,6 +1794,7 @@ show_reality_info() {
     purple "Reality PublicKey: ${PUBLIC_KEY}"
     purple "Reality ShortID: ${SHORT_ID}"
     purple "Reality Fingerprint: ${default_fingerprint}"
+    [ -n "${EXTERNAL_ADDR:-}" ] && purple "外部映射地址(NAT): ${EXTERNAL_ADDR}"
 
     list_users
     yellow "\n用户链接："
@@ -1686,7 +1803,7 @@ show_reality_info() {
         load_user_file "$file"
         [ -n "$NAME" ] || continue
         purple "${NAME} ($(inbound_label "$INBOUND_TYPE")) -> ${OUTBOUND_TAG}"
-        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
+        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME" "${EXTERNAL_PORT:-}"
     done
 }
 
@@ -1732,7 +1849,7 @@ url="https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/sing-box.sh"
 tmp=$(mktemp) || { echo "创建临时文件失败" >&2; exit 1; }
 trap 'rm -f "$tmp"' EXIT
 
-if ! curl -fsSL "$url" -o "$tmp"; then
+if ! curl -fsSL --connect-timeout 10 --max-time 60 "$url" -o "$tmp"; then
     echo "拉取 sing-box.sh 失败，请检查网络或稍后重试。" >&2
     exit 1
 fi
@@ -1770,11 +1887,41 @@ prompt_reality_settings() {
     reading "请输入 Reality 端口（回车随机，默认 ${PORT}）: " p
     [ -n "$p" ] || p="$PORT"
     validate_port "$p" || { red "端口范围需在 1-65535"; return 1; }
+    if port_socket_in_use "$p" tcp; then
+        red "端口 ${p} 已被其他进程监听，请换一个端口。"
+        return 1
+    fi
     PORT="$p"
     reading "请输入 Reality 伪装域名/SNI（回车默认 ${REALITY_DOMAIN}）: " p
     [ -n "$p" ] || p="$REALITY_DOMAIN"
     validate_domain "$p" || { red "域名需为包含点的 FQDN，且只能包含字母、数字、点或连字符。"; return 1; }
     REALITY_DOMAIN="$p"
+}
+
+# 小内存机（NAT VPS 常见 64-128MB）安装后提示创建 swap，避免运行/更新期 OOM（容器环境可能不支持，仅提示）
+suggest_swap() {
+    local total_mb swap_mb
+    [ -r /proc/meminfo ] || return 0
+    total_mb=$(awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    swap_mb=$(awk '/^SwapTotal:/ {printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+    [ -n "$total_mb" ] || return 0
+    [ "${swap_mb:-0}" -eq 0 ] || return 0
+    [ "$total_mb" -lt 160 ] || return 0
+    yellow "检测到内存 ${total_mb}MB 且未启用 swap，建议创建 swap 避免 OOM（OpenVZ/LXC 等容器可能不支持，忽略即可）："
+    yellow "  dd if=/dev/zero of=/swapfile bs=1M count=128 && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && echo '/swapfile swap swap defaults 0 0' >> /etc/fstab"
+}
+
+# 检测无公网 IPv4 的 NAT 环境：本机网卡仅有私网地址时提示核对商家分配的外部映射
+nat_env_hint() {
+    local pub=""
+    if command_exists ip; then
+        # 注意只取 inet 行：接口头行（"2: eth0: <...>"）的 $2 是接口名而非地址
+        pub=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 \
+            | grep -vE '^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|169\.254\.|100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.)' | head -n 1)
+    fi
+    [ -z "$pub" ] || return 0
+    yellow "检测到 NAT 环境（本机无公网 IPv4）：节点链接中的端口为本机监听端口。"
+    yellow "若商家分配了独立的外部映射地址/端口，请在主菜单选择 9 设置外部映射，或手动替换链接中的地址与端口。"
 }
 
 run_install_flow() {
@@ -1784,11 +1931,14 @@ run_install_flow() {
         # 状态文件存在但仍不完整（缺 UUID/密钥等）时不应静默生成“零入站”配置
         migrate_legacy_state || { red "状态文件不完整，无法继续。请先清理后重新初始化，或手动核对 reality.env。"; return 1; }
         write_config || return 1
-        allow_port "$PORT"
+        # 仅当存在 Reality 入站时才放行主端口（hy2/ss-only 安装从未占用过 PORT）
+        has_inbound_type "vless-reality" && allow_port "$PORT"
         install_service
         install_logrotate
         show_reality_info
         create_shortcut
+        suggest_swap
+        nat_env_hint
         return 0
     fi
 
@@ -1811,11 +1961,13 @@ run_install_flow() {
     uuid=$(generate_uuid)
     save_selected_user "$default_user_name" "$uuid" "$direct_outbound_tag"
     write_config || exit 1
-    allow_port "$SELECTED_INBOUND_PORT"
+    allow_inbound_port "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PORT"
     install_service
     install_logrotate
     create_shortcut
     show_reality_info
+    suggest_swap
+    nat_env_hint
 }
 
 change_port() {
@@ -1844,6 +1996,11 @@ change_port() {
         load_forward_file "$file" || continue
         [ "$LOCAL_PORT" = "$new_port" ] && { red "端口 ${new_port} 已被转发规则 \"${TAG}\" 占用"; return 1; }
     done
+    # 不能撞上其他进程已监听的端口（否则重启后 sing-box 绑定失败、无限重启）
+    if port_socket_in_use "$new_port" tcp; then
+        red "端口 ${new_port} 已被其他进程监听，请换一个端口。"
+        return 1
+    fi
 
     PORT="$new_port"
     save_state
@@ -1931,6 +2088,14 @@ select_inbound_port() {
     validate_port "$port" || { red "端口范围需在 1-65535"; return 1; }
     if inbound_port_in_use "$port" "$inbound_type"; then
         red "端口已被现有入站占用: $port"
+        return 1
+    fi
+    # 端口被其他进程真实监听时不允许新建入站；加入同协议已有端口组除外
+    # （此时 sing-box 自身就在监听该端口，属预期占用）
+    local link_proto="tcp"
+    [ "$inbound_type" = "hysteria2" ] && link_proto="udp"
+    if port_socket_in_use "$port" "$link_proto" && ! inbound_group_exists "$inbound_type" "$port"; then
+        red "端口 ${port} 已被其他进程监听，请换一个端口。"
         return 1
     fi
     # 亦不能与 TCP/UDP 转发的本地监听端口冲突
@@ -2021,7 +2186,7 @@ create_bound_user_for_outbound() {
 
     allow_port "$SELECTED_INBOUND_PORT"
     green "已添加落地并自动绑定用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
-    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" ""
+    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "" ""
 }
 
 add_inbound() {
@@ -2069,13 +2234,13 @@ add_inbound() {
         return 1
     fi
 
-    allow_port "$SELECTED_INBOUND_PORT"
+    allow_inbound_port "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PORT"
     if [ "$join" -eq 1 ]; then
         green "已加入入站：${name} -> ${outbound_tag} (${SELECTED_INBOUND_TYPE}, port=${SELECTED_INBOUND_PORT})"
     else
         green "已添加入站用户：${name} -> ${outbound_tag} ($(inbound_label "$SELECTED_INBOUND_TYPE"), port=${SELECTED_INBOUND_PORT})"
     fi
-    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "$SELECTED_INBOUND_USERNAME"
+    print_user_links "$uuid" "$name" "$default_flow" "$SELECTED_INBOUND_TYPE" "$SELECTED_INBOUND_PASSWORD" "$SELECTED_INBOUND_METHOD" "$SELECTED_INBOUND_PORT" "$SELECTED_INBOUND_SNI" "$SELECTED_INBOUND_USERNAME" ""
 }
 
 # 把已导入的落地绑定为指定入站分组上的【新用户】（自动生成凭据，不覆盖现有用户）
@@ -2119,13 +2284,13 @@ bind_landing_to_group() {
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
-    allow_port "$port"
+    allow_inbound_port "$type" "$port"
     green "已绑定落地：用户 ${name} -> ${outbound_tag} (${type}, port=${port})"
 }
 
 # 修改某个入站的 outbound 绑定（失败自动还原）
 change_user_outbound() {
-    local name="$1" new_outbound_tag="$2" file old_outbound_tag status sni usr
+    local name="$1" new_outbound_tag="$2" file old_outbound_tag status sni usr ep
     file=$(user_file "$name")
     [ -f "$file" ] || { red "入站不存在：$name"; return 1; }
     outbound_exists "$new_outbound_tag" || { red "落地不存在：$new_outbound_tag"; return 1; }
@@ -2134,12 +2299,13 @@ change_user_outbound() {
     [ "$old_outbound_tag" = "$new_outbound_tag" ] && { yellow "绑定未变化。"; return 0; }
     sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
     usr="$USERNAME"
-    save_user "$name" "$UUID" "$new_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr"
+    ep="$EXTERNAL_PORT"
+    save_user "$name" "$UUID" "$new_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr" "$ep"
     apply_config
     status=$?
     if [ "$status" -ne 0 ]; then
         sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
-        save_user "$name" "$UUID" "$old_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr"
+        save_user "$name" "$UUID" "$old_outbound_tag" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$sni" "$usr" "$ep"
         write_config >/dev/null 2>&1 || true
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
@@ -2178,7 +2344,7 @@ delete_user() {
 
 # 修改入站端口（组级：同协议同端口整组迁移）；Reality 走 change_port（主端口）
 change_inbound_port_group() {
-    local type="$1" old_port="$2" new_port status members name backup_dir f u o fl i pw m sn un
+    local type="$1" old_port="$2" new_port status members name backup_dir f u o fl i pw m sn un ep link_proto
     if [ "$type" = "vless-reality" ]; then
         change_port
         return
@@ -2191,6 +2357,13 @@ change_inbound_port_group() {
     [ "$new_port" = "$old_port" ] && { yellow "端口未变化。"; return 0; }
     if inbound_port_in_use "$new_port" "$type"; then
         red "端口已被现有入站或转发占用：$new_port"
+        return 1
+    fi
+    # 不能撞上其他进程已监听的端口
+    link_proto="tcp"
+    [ "$type" = "hysteria2" ] && link_proto="udp"
+    if port_socket_in_use "$new_port" "$link_proto"; then
+        red "端口 ${new_port} 已被其他进程监听，请换一个端口。"
         return 1
     fi
 
@@ -2208,7 +2381,8 @@ change_inbound_port_group() {
         m=$(read_env_value "$f" METHOD || true)
         sn=$(read_env_value "$f" H2_SNI || true)
         un=$(read_env_value "$f" USERNAME || true)
-        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$new_port" "$sn" "$un"
+        ep=$(read_env_value "$f" EXTERNAL_PORT || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$new_port" "$sn" "$un" "$ep"
     done
 
     apply_config
@@ -2221,13 +2395,13 @@ change_inbound_port_group() {
         return 1
     fi
     rm -rf "$backup_dir"
-    allow_port "$new_port"
+    allow_inbound_port "$type" "$new_port"
     green "入站端口已更新：$(group_label "$type" "$old_port") -> ${new_port}（用户: ${members}）"
 }
 
 # 修改入站 SNI（组级，整组一致）；Reality 走 change_reality_domain，仅 hy2 支持自定义 SNI
 change_inbound_sni_group() {
-    local type="$1" port="$2" sni old_sni status members name backup_dir f u o fl i pw m sn
+    local type="$1" port="$2" sni old_sni status members name backup_dir f u o fl i pw m un ep
     if [ "$type" = "vless-reality" ]; then
         change_reality_domain
         return
@@ -2256,8 +2430,9 @@ change_inbound_sni_group() {
         i=$(read_env_value "$f" INBOUND_TYPE || true)
         pw=$(read_env_value "$f" PASSWORD || true)
         m=$(read_env_value "$f" METHOD || true)
-        sn=$(read_env_value "$f" H2_SNI || true)
-        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$port" "$sni"
+        un=$(read_env_value "$f" USERNAME || true)
+        ep=$(read_env_value "$f" EXTERNAL_PORT || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$port" "$sni" "$un" "$ep"
     done
 
     apply_config
@@ -2275,7 +2450,7 @@ change_inbound_sni_group() {
 
 # 修改 SS/HY2 入站密码
 change_inbound_password() {
-    local name="$1" file pw old_pw status sni
+    local name="$1" file pw old_pw status sni ep
     file=$(user_file "$name")
     load_user_file "$file"
     if [ "$INBOUND_TYPE" != "shadowsocks" ] && [ "$INBOUND_TYPE" != "hysteria2" ]; then
@@ -2285,13 +2460,14 @@ change_inbound_password() {
     reading "请输入新的密码（回车自动生成）: " pw
     [ -n "$pw" ] || pw=$(generate_password)
     old_pw="$PASSWORD"
+    ep="$EXTERNAL_PORT"
     sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
-    save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$pw" "$METHOD" "$INBOUND_PORT" "$sni"
+    save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$pw" "$METHOD" "$INBOUND_PORT" "$sni" "" "$ep"
     apply_config
     status=$?
     if [ "$status" -ne 0 ]; then
         sni=""; [ "$INBOUND_TYPE" = "hysteria2" ] && sni="$H2_SNI"
-        save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$old_pw" "$METHOD" "$INBOUND_PORT" "$sni"
+        save_user "$name" "$UUID" "$OUTBOUND_TAG" "$FLOW" "$INBOUND_TYPE" "$old_pw" "$METHOD" "$INBOUND_PORT" "$sni" "" "$ep"
         write_config >/dev/null 2>&1 || true
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
@@ -2339,10 +2515,10 @@ list_inbound_groups() {
     done
 }
 
-# 选择一个入站分组到全局 GROUP_TYPE/GROUP_PORT/GROUP_MEMBERS
+# 选择一个入站分组到全局 GROUP_TYPE/GROUP_PORT
 select_inbound_group() {
-    local g idx name
-    GROUP_TYPE=""; GROUP_PORT=""; GROUP_MEMBERS=()
+    local g
+    GROUP_TYPE=""; GROUP_PORT=""
     collect_inbound_groups
     if [ "${#INBOUND_GROUPS[@]}" -eq 0 ]; then
         yellow "暂无入站。请先选择 1 初始化节点，或在本菜单选择 1 增加入站。"
@@ -2353,9 +2529,6 @@ select_inbound_group() {
     g="${INBOUND_GROUPS[$((PICKED_INDEX - 1))]}"
     GROUP_TYPE="${g%%|*}"
     GROUP_PORT="${g##*|}"
-    for name in $(group_member_names "$GROUP_TYPE" "$GROUP_PORT"); do
-        GROUP_MEMBERS+=("$name")
-    done
 }
 
 # 选择一个组内用户到全局 GROUP_MEMBER
@@ -2422,10 +2595,10 @@ add_user_to_inbound() {
         [ "$status" -eq 2 ] && restart_singbox >/dev/null 2>&1 || true
         return 1
     fi
-    allow_port "$port"
+    allow_inbound_port "$type" "$port"
     green "已添加用户：${name} -> ${outbound_tag} ($(group_label "$type" "$port"))"
     load_user_file "$(user_file "$name")"
-    print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
+    print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME" "${EXTERNAL_PORT:-}"
 }
 
 # 删除整个入站分组（连同其所有用户；失败自动还原；保留至少一个用户保护）
@@ -2464,7 +2637,7 @@ list_node_links() {
         user_is_visible || continue
         found=1
         green "${NAME} ($(inbound_label "$INBOUND_TYPE"), port=${INBOUND_PORT}) -> ${OUTBOUND_TAG}"
-        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME"
+        print_user_links "$UUID" "$NAME" "$FLOW" "$INBOUND_TYPE" "$PASSWORD" "$METHOD" "$INBOUND_PORT" "$H2_SNI" "$USERNAME" "${EXTERNAL_PORT:-}"
     done
     [ "$found" -eq 1 ] || yellow "（暂无可见节点）"
 }
@@ -2916,12 +3089,14 @@ install_realm() {
     [ -x "$realm_bin" ] && return 0
     arch=$(detect_arch)
     target=$(realm_target_for_arch "$arch") || { red "realm 暂不支持该架构: $(uname -m)"; return 1; }
-    latest=$(curl -fsSL "https://api.github.com/repos/zhboner/realm/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)
+    latest=$(curl -fsSL --connect-timeout 10 --max-time 30 "https://api.github.com/repos/zhboner/realm/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name":[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)
     [ -n "$latest" ] || { red "获取 realm 版本失败"; return 1; }
-    tmp_dir=$(mktemp -d)
+    # 临时目录放磁盘（/etc/realm 下），避免 /tmp 为 tmpfs 时下载包吃内存
+    mkdir -p "$realm_work"
+    tmp_dir=$(mktemp -d "${realm_work}/.dl.XXXXXX")
     dl_url="https://github.com/zhboner/realm/releases/download/v${latest}/realm-${target}.tar.gz"
     yellow "下载 realm v${latest} (${target})..."
-    if ! curl -fL --retry 3 -o "$tmp_dir/realm.tar.gz" "$dl_url"; then
+    if ! curl -fL --retry 3 --connect-timeout 10 --max-time 120 -o "$tmp_dir/realm.tar.gz" "$dl_url"; then
         case "$target" in
             *-gnu)      target="${target%-unknown-linux-gnu}-unknown-linux-musl" ;;
             *-musleabihf) target="${target%-unknown-linux-musleabihf}-unknown-linux-gnu" ;;
@@ -2929,10 +3104,9 @@ install_realm() {
         esac
         dl_url="https://github.com/zhboner/realm/releases/download/v${latest}/realm-${target}.tar.gz"
         yellow "回退尝试 libc: ${target}"
-        curl -fL --retry 3 -o "$tmp_dir/realm.tar.gz" "$dl_url" || { rm -rf "$tmp_dir"; red "realm 下载失败"; return 1; }
+        curl -fL --retry 3 --connect-timeout 10 --max-time 120 -o "$tmp_dir/realm.tar.gz" "$dl_url" || { rm -rf "$tmp_dir"; red "realm 下载失败"; return 1; }
     fi
     tar -xzf "$tmp_dir/realm.tar.gz" -C "$tmp_dir" 2>/dev/null || { rm -rf "$tmp_dir"; red "解压 realm 失败"; return 1; }
-    mkdir -p "$realm_work"
     realm_file="$tmp_dir/realm"
     [ -f "$realm_file" ] || realm_file=$(find "$tmp_dir" -type f -name realm 2>/dev/null | head -n 1)
     [ -n "$realm_file" ] && [ -f "$realm_file" ] || { rm -rf "$tmp_dir"; red "未在压缩包中找到 realm 可执行文件"; return 1; }
@@ -3131,6 +3305,16 @@ add_forward() {
         return 1
     fi
 
+    # 本地端口不能被其他进程真实监听（realm 将绑定该端口；realm 自身已占用的端口
+    # 已被上方转发规则循环排除，这里撞上即为外来进程或残留进程）
+    local pf
+    for pf in $protocol; do
+        if port_socket_in_use "$local_port" "$pf"; then
+            red "本地端口 ${local_port}(${pf}) 已被其他进程监听，请换一个端口。"
+            return 1
+        fi
+    done
+
     save_forward "$tag" "$protocol" "$local_port" "$target_addr" "$target_port"
 
     if ! require_realm; then
@@ -3261,12 +3445,67 @@ manage_singbox() {
     esac
 }
 
+# 卸载前尽力收回放行过的防火墙端口（iptables/ip6tables/ufw/firewalld）。
+# 必须在删除 ${work_dir} 之前执行：需要读取 reality.env、users.d、forwards.d 还原端口清单。
+# 端口与放行时的 allow_port/allow_inbound_port 一一对应（hy2 为 udp，其余 tcp，转发按协议）。
+revoke_allowed_ports() {
+    local touched=0 file proto port seen=""
+    load_state 2>/dev/null || true
+
+    if [ -n "${PORT:-}" ] && has_inbound_type "vless-reality"; then
+        seen="tcp ${PORT}"
+    fi
+    for file in "$users_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_user_file "$file"
+        user_is_visible || continue
+        [ "$INBOUND_TYPE" = "vless-reality" ] && continue
+        validate_port "$INBOUND_PORT" || continue
+        if [ "$INBOUND_TYPE" = "hysteria2" ]; then proto="udp"; else proto="tcp"; fi
+        seen="${seen} ${proto} ${INBOUND_PORT}"
+    done
+    for file in "$forwards_dir"/*.env; do
+        [ -f "$file" ] || continue
+        load_forward_file "$file" || continue
+        validate_port "$LOCAL_PORT" || continue
+        [ -z "$PROTOCOL" ] && PROTOCOL="tcp udp"
+        for proto in $PROTOCOL; do
+            seen="${seen} ${proto} ${LOCAL_PORT}"
+        done
+    done
+
+    # seen 为 "proto port proto port ..." 序列，逐对删除
+    set -- $seen
+    while [ $# -ge 2 ]; do
+        proto="$1"
+        port="$2"
+        shift 2
+        command_exists ufw && ufw delete allow "${port}/${proto}" >/dev/null 2>&1 && touched=1
+        if command_exists firewall-cmd; then
+            firewall-cmd --permanent --remove-port="${port}/${proto}" >/dev/null 2>&1 && touched=1
+        fi
+        if command_exists iptables; then
+            iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 && touched=1
+        fi
+        if command_exists ip6tables; then
+            ip6tables -D INPUT -p "$proto" --dport "$port" -j ACCEPT >/dev/null 2>&1 && touched=1
+        fi
+    done
+
+    command_exists firewall-cmd && firewall-cmd --reload >/dev/null 2>&1 || true
+    [ "$touched" -eq 1 ] && persist_iptables_rules
+    return 0
+}
+
 uninstall_singbox() {
-    local choice file
+    local choice
     reading "确定要卸载 sing-box 并删除 ${work_dir} 吗？(y/n): " choice
     case "$choice" in
         y|Y)
             yellow "正在卸载 sing-box..."
+
+            # 先收回防火墙放行端口（需读取 users.d/forwards.d/reality.env，须在删除 work_dir 前执行）
+            revoke_allowed_ports
 
             # 清理所有转发规则（realm 服务 + 配置）
             uninstall_realm_service
@@ -3283,10 +3522,17 @@ uninstall_singbox() {
                 rm -f /etc/systemd/system/sing-box.service
                 systemctl daemon-reload >/dev/null 2>&1 || true
             fi
+            rm -f /var/run/sing-box.pid 2>/dev/null || true
             rm -rf "$work_dir"
             rm -f /usr/bin/sb
             rm -f /etc/logrotate.d/sing-box
             green "sing-box 已卸载。"
+
+            # 残留说明（均为安装期引入的依赖包，可能被其他程序共用，故不自动卸载）
+            if [ -e /usr/bin/sing-box ]; then
+                yellow "注意: /usr/bin/sing-box 仍存在（可能由包管理器安装），如需清理可执行: apk del sing-box sing-box-openrc"
+            fi
+            yellow "以下依赖包为安装时引入，如无其他程序使用可手动清理: curl tar ca-certificates gcompat libc6-compat libstdc++ openssl logrotate"
             ;;
         *)
             yellow "已取消卸载。"
@@ -3301,6 +3547,68 @@ ensure_shortcut() {
     # 仅在已安装（存在运行状态与配置）时才创建快捷命令，避免仅查看菜单就改写系统
     [ -f "$state_file" ] && [ -f "$config_dir" ] || return 0
     create_shortcut
+}
+
+# NAT VPS 外部映射设置：
+#   EXTERNAL_ADDR（reality.env）全局覆盖链接中的地址；
+#   EXTERNAL_PORT（users.d/<name>.env）按入站组覆盖链接中的端口。
+# 两者仅影响节点链接展示，不改变 sing-box 实际监听，也不触发重启。
+set_external_mapping() {
+    require_reality_state || return 1
+    load_state
+
+    local addr ep choice type port name f u o fl i pw m sn un
+    clear_screen
+    green "\n=== 外部地址/端口映射（NAT） ===\n"
+    purple "当前外部地址: ${EXTERNAL_ADDR:-（未设置，使用自动探测地址）}"
+    reading "请输入外部地址（IP 或域名，输入 0 清除，回车保持不变）: " addr
+    if [ -n "$addr" ]; then
+        if [ "$addr" = "0" ]; then
+            EXTERNAL_ADDR=""
+            green "已清除外部地址，链接将恢复使用自动探测地址。"
+        else
+            addr="${addr#\[}"
+            addr="${addr%\]}"
+            validate_host_address "$addr" || { red "地址无效。"; return 1; }
+            EXTERNAL_ADDR="$addr"
+            green "外部地址已更新: ${EXTERNAL_ADDR}"
+        fi
+        save_state
+    fi
+
+    reading "是否设置某个入站的外部映射端口？(y/n): " choice
+    case "$choice" in
+        y|Y) ;;
+        *) return 0 ;;
+    esac
+    select_inbound_group || return 1
+    type="$GROUP_TYPE"
+    port="$GROUP_PORT"
+    reading "请输入 ${type} :${port} 的外部映射端口（输入 0 清除，回车取消）: " ep
+    [ -n "$ep" ] || return 0
+    if [ "$ep" != "0" ]; then
+        validate_port "$ep" || { red "端口范围需在 1-65535"; return 1; }
+    else
+        ep=""
+    fi
+
+    for name in $(group_member_names "$type" "$port"); do
+        f=$(user_file "$name")
+        u=$(read_env_value "$f" UUID || true)
+        o=$(read_env_value "$f" OUTBOUND_TAG || true)
+        fl=$(read_env_value "$f" FLOW || true)
+        i=$(read_env_value "$f" INBOUND_TYPE || true)
+        pw=$(read_env_value "$f" PASSWORD || true)
+        m=$(read_env_value "$f" METHOD || true)
+        sn=$(read_env_value "$f" H2_SNI || true)
+        un=$(read_env_value "$f" USERNAME || true)
+        save_user "$name" "$u" "$o" "$fl" "$i" "$pw" "$m" "$port" "$sn" "$un" "$ep"
+    done
+    if [ -n "$ep" ]; then
+        green "已设置外部映射端口：$(group_label "$type" "$port") -> ${ep}（仅影响链接展示，无需重启）"
+    else
+        green "已清除外部映射端口：$(group_label "$type" "$port")"
+    fi
 }
 
 menu() {
@@ -3318,8 +3626,10 @@ menu() {
     green "6. TCP/UDP 转发管理"
     green "7. 服务与日志"
     red "8. 卸载 sing-box"
+    green "9. 外部地址/端口映射（NAT）"
     red "0. 退出脚本"
-    reading "请输入选择(0-8): " choice
+    # 注意：menu_choice 故意使用全局变量（menu 内不声明 local），供主循环读取
+    reading "请输入选择(0-9): " menu_choice
 }
 
 trap 'red "已取消操作"; exit 130' INT
@@ -3335,7 +3645,7 @@ while true; do
     # 每轮菜单操作重新探测出口/IPv6 地址（同一轮操作内多用户共享缓存结果）
     unset SERVER_IP_CACHE SERVER_IPV6_CACHE
     menu
-    case "$choice" in
+    case "$menu_choice" in
         1) run_install_flow ;;
         2) import_outbound_auto ;;
         3) list_node_links ;;
@@ -3344,8 +3654,9 @@ while true; do
         6) manage_forwards_menu ;;
         7) manage_singbox ;;
         8) uninstall_singbox ;;
+        9) set_external_mapping ;;
         0) exit 0 ;;
-        *) red "无效的选项，请输入 0 到 8" ;;
+        *) red "无效的选项，请输入 0 到 9" ;;
     esac
     read -r -n 1 -s -p $'\033[1;91m按任意键返回...\033[0m'
     echo ""

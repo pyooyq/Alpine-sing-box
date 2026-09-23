@@ -77,7 +77,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/pyooyq/Alpine-sing-box/main/si
 sb
 ```
 
-菜单支持：安装/初始化节点、添加落地、列出节点链接、入站管理（增/删/改入站与用户；SS/HY2 可在入站管理里改密码）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载。
+菜单支持：安装/初始化节点、添加落地、列出节点链接、入站管理（增/删/改入站与用户；SS/HY2 可在入站管理里改密码）、落地管理（查看/删除/改绑）、TCP/UDP 转发管理、服务与日志（启动/停止/重启/日志）、卸载、外部地址/端口映射（NAT）。
 
 ## 使用方式
 
@@ -100,7 +100,7 @@ sb
 
 ## TCP/UDP 转发
 
-如需把当前 VPS 作为纯 TCP/UDP 转发器（不处理协议、不解析流量），可在主菜单选择 **5. TCP/UDP 转发管理** 添加转发规则：
+如需把当前 VPS 作为纯 TCP/UDP 转发器（不处理协议、不解析流量），可在主菜单选择 **6. TCP/UDP 转发管理** 添加转发规则：
 
 1. 输入规则名称，选择协议（`tcp` / `udp` / `both`）。
 2. 输入本地监听端口和目标地址:端口。
@@ -128,7 +128,11 @@ sb
 - 运行状态保存在 `/etc/sing-box/reality.env`、`/etc/sing-box/users.d/`、`/etc/sing-box/outbounds.d/` 和 `/etc/sing-box/forwards.d/`
 - 旧版单用户安装会自动迁移为 `default-direct` 用户，并继续绑定本机直连 `direct`
 - `-port` 指定的是 Reality 主入站端口；添加落地时若没有任何入站，会自动创建使用该端口的 Reality 用户
-- 入站端口会在防火墙自动放行：ufw / firewalld 规则本身持久化；iptables/ip6tables 在有持久化机制（netfilter-persistent / iptables.service / OpenRC iptables）时自动保存并开机恢复，无可用机制时提示需手动放行
+- 入站端口会在防火墙自动放行：ufw / firewalld 规则本身持久化；iptables/ip6tables 在有持久化机制（netfilter-persistent / iptables.service / OpenRC iptables）时自动保存并开机恢复，无可用机制时提示需手动放行。放行协议与入站匹配：Hysteria2 放行 UDP，其余放行 TCP；卸载时会按当前配置自动收回这些放行规则
+- NAT VPS 支持：主菜单 **9. 外部地址/端口映射（NAT）** 可设置外部地址（`EXTERNAL_ADDR`，覆盖链接中的服务器地址）与按入站设置外部映射端口（`EXTERNAL_PORT`，覆盖链接中的端口），两者仅影响节点链接展示、不改变实际监听，也不触发服务重启
+- 小内存机器（64-128MB）适配：检测到内存 ≤96MB/≤192MB 时为 sing-box 服务注入 `GOMEMLIMIT=32MiB/64MiB` 软内存上限防止 OOM；下载解压的临时目录放在磁盘而非 `/tmp`（避免 tmpfs 吃内存）；安装完成后内存不足且无 swap 时会给出创建 swap 的建议命令
+- 新增/修改入站与转发端口时会检查端口是否已被其他进程真实监听（`ss`/`netstat`），避免 sing-box/realm 绑定失败导致静默重启循环
+- Alpine 上会自动安装 `logrotate` 包（含每日定时入口），确保 sing-box 日志轮转真正生效，防止小磁盘被日志写爆
 - IPv6 检测顺序：本机网卡全局单播地址（`ip -6` / `ifconfig`，排除 fe80 链路本地与 fc/fd 私有段）→ IPv6 出口探测（`curl -6`）兜底；检测结果仅用于生成节点链接与 realm 监听地址，每次菜单操作重新探测一次
 - realm 转发仅在“有公网 IPv6 且 `net.ipv6.bindv6only=0`（Linux 默认）”时监听 `[::]` 双栈，否则保持 `0.0.0.0`；已部署的转发规则在下次增删/重载时自动应用新监听地址
 - 守护：只要未手动”停止”，进程被杀会自动重启（systemd `Restart=always` / OpenRC respawn 包装器）；手动停止后不会复活
